@@ -1,0 +1,366 @@
+---
+title: "Séries temporais hierárquicas para previsão de tráfego em rodovias brasileiras"
+author: "Rafael Rodrigues da Costa Carvalho, Robson Bruno Dutra Pereira"
+format: html
+editor: visual
+---
+
+# Carregando os pacotes
+
+```{r}
+library(tidyverse)
+library(fs)
+library(readr)
+library(lubridate)
+library(tsibble)
+library(fabletools)
+library(feasts)
+```
+
+# Organizando os dados - Essa seção é executada somente quando precisar importar novos dados
+
+Criar a nova pasta consolidada para a BR-040
+
+```{r}
+#| eval: false
+#| include: false
+ nova_pasta <- "dados_consolidados/BR_040"
+dir_create(nova_pasta) 
+```
+
+```{r}
+#| eval: false
+#| include: false
+todos_csvs <- dir_ls(path = ".", recurse = TRUE, glob = "*.csv")
+```
+
+```{r}
+#| eval: false
+#| include: false
+arquivos_baguncados <- todos_csvs[str_detect(todos_csvs, "^\\.?/?dados")]
+```
+
+```{r}
+#| eval: false
+#| include: false
+novos_caminhos <- path(nova_pasta, path_file(arquivos_baguncados))
+```
+
+```{r}
+#| eval: false
+#| include: false
+file_copy(path = arquivos_baguncados, new_path = novos_caminhos, overwrite = TRUE)
+```
+
+# Removendo os arquivos vmdm e vtd
+
+```{r}
+pasta_dados <- "dados_consolidados/BR_040" # Alterar a pasta da BR quando for necessário
+```
+
+```{r}
+todos_arquivos <- dir_ls(pasta_dados, glob = "*.csv")
+```
+
+```{r}
+arquivos_granulares <- todos_arquivos %>%
+  str_subset("vmdm|vtd", negate = TRUE)
+```
+
+# Organizando os dados
+
+```{r}
+# Ler e empilhar com tolerância a colunas faltantes/diferentes
+
+# Criamos uma pequena função para ler um arquivo e já guardar o nome dele
+ler_csv_seguro <- function(caminho) {
+  read_csv2(
+    caminho,
+    skip = 2, # Pulando o cabeçalho
+    show_col_types = FALSE
+  ) %>%
+    # Adicionamos o caminho como coluna manualmente
+    mutate(caminho_arquivo = caminho)
+}
+
+# A função map_dfr aplica a nossa leitura segura a todos os arquivos da lista
+# e os empilha (bind_rows) preenchendo as colunas faltantes com NA
+dados_brutos <- map_dfr(arquivos_granulares, ler_csv_seguro)
+```
+
+```{r}
+# Limpeza, Extração e Transformação Definitiva
+dados_limpos <- dados_brutos %>%
+  # Remover a coluna 'Faixa'
+  select(-any_of(c("faixa", "Faixa", "FAIXA"))) %>%
+  
+  # Extrair metadados do nome do arquivo 
+  mutate(nome_arquivo = basename(caminho_arquivo)) %>%
+  mutate(nome_arquivo = str_remove(nome_arquivo, "\\.csv")) %>%
+  separate(
+    col = nome_arquivo, 
+    into = c("BR", "Estado", "KM", "Ano_Arquivo"), 
+    sep = "_",
+    extra = "drop" 
+  ) %>%
+  mutate(KM = str_remove(KM, "km")) %>%
+  
+  # Remover a coluna auxiliar de caminho
+  select(-caminho_arquivo) %>%
+  
+  # Tratar a Data 
+  mutate(Data = dmy(Data)) %>%
+  
+  # Pivotar as categorias de A até L
+  # Usamos as crases (`) porque os nomes das colunas têm espaços e parênteses
+  pivot_longer(
+    cols = `(A) Ônibus/Caminhão de 2 eixos`:`(L) Indefinido`, 
+    names_to = "Tipo_Veiculo", 
+    values_to = "Volume"
+  ) %>%
+  
+  # Opcional: Limpar o nome do Tipo de Veículo para deixar só a letra
+  # Isso facilita muito na hora de montar a hierarquia!
+  mutate(Tipo_Veiculo = str_extract(Tipo_Veiculo, "(?<=\\()[A-Z](?=\\))"))
+```
+
+# Transformando os dados em tsibble para séries temporais
+
+```{r}
+library(tsibble)
+
+dados_ts <- dados_limpos %>%
+  # Criar o Índice de Tempo (Concatenar data e hora e deixar em frequência horária)
+  mutate(Data_Hora = make_datetime(year(Data), month(Data), day(Data), as.numeric(Hora))) %>%
+  
+  # Descartar colunas antigas
+  select(-Data, -Hora, -Ano_Arquivo) %>%
+  
+  # Remove linhas que são cópias exatas umas das outras (estava dando erro anteriormente)
+  distinct() %>% 
+  
+  # Agrupa pela chave hierárquica e pelo tempo
+  group_by(Estado, BR, KM, Sentido, Tipo_Veiculo, Data_Hora) %>%
+  
+  # Se sobrarem leituras na mesma hora, soma o volume delas
+  summarise(Volume = sum(Volume, na.rm = TRUE), .groups = "drop") %>%
+  # ------------------------------------------
+  
+  # Converter para tsibble
+  as_tsibble(
+    index = Data_Hora,
+    key = c(Estado, BR, KM, Sentido, Tipo_Veiculo) 
+  )
+
+# Verificar o resultado
+dados_ts
+```
+
+# Em ordem cronológica
+
+```{r}
+dados_ts %>% arrange(Data_Hora)
+```
+
+
+# Visualização Exploratória dos Dados (2021 a 2025)
+
+Ignoramos 2014-2019 pois não existem dados de 2020
+
+
+```{r}
+# Preparar os dados para plotagem
+# Filtrar o período e agregar por Mês ao invés de dia para que os gráficos fiquem legíveis e renderizem rápido (mais de 43800 pontos por linha ao renderizar por dia)
+dados_viz <- dados_ts %>%
+  filter_index("2021-01-01" ~ "2025-12-31") %>%
+  
+  # Agrupa pelo cruzamento das chaves atuais, mas muda o índice para Mensal
+  group_by_key() %>%
+  index_by(Mes = ~ yearmonth(.)) %>%
+  
+  # Soma o volume horário para obter o volume total mensal
+  summarise(Volume = sum(Volume, na.rm = TRUE), .groups = "drop")
+```
+
+# Plots
+
+## Tráfego Total da BR-381
+
+```{r}
+# Soma de todos os KMs, Sentidos e Tipos
+dados_viz %>%
+  summarise(Volume_Total = sum(Volume, na.rm = TRUE)) %>%
+  ggplot(aes(x = Mes, y = Volume_Total)) +
+  geom_line(color = "darkblue", linewidth = 1) +
+  theme_minimal() +
+  scale_y_continuous(labels = scales::comma) + # Evita notação científica 
+  labs(
+    title = "Volume Total Mensal - BR-381",
+    subtitle = "Período: 2021 a 2025",
+    x = "Mês",
+    y = "Volume Total de Veículos"
+  )
+```
+## Tráfego por Sentido
+
+```{r}
+dados_viz %>%
+  group_by(Sentido) %>%
+  summarise(Volume = sum(Volume, na.rm = TRUE)) %>%
+  ggplot(aes(x = Mes, y = Volume, color = Sentido)) +
+  geom_line(linewidth = 1) +
+  theme_minimal() +
+  scale_y_continuous(labels = scales::comma) +
+  labs(
+    title = "Volume Mensal por Sentido de Via",
+    x = "Mês",
+    y = "Volume",
+    color = "Sentido"
+  )
+```
+## Tráfego por Tipo de Veículo
+
+```{r}
+dados_viz %>%
+  group_by(Tipo_Veiculo) %>%
+  summarise(Volume = sum(Volume, na.rm = TRUE)) %>%
+  ggplot(aes(x = Mes, y = Volume, color = Tipo_Veiculo)) +
+  geom_line(linewidth = 0.8) +
+  facet_wrap(~ Tipo_Veiculo, scales = "free_y") + 
+  scale_y_continuous(labels = scales::label_number(big.mark = ".", decimal.mark = ",")) +
+  theme_minimal() +
+  theme(legend.position = "none") +
+  labs(
+    title = "Volume Mensal Desagregado por Tipo de Veículo",
+    subtitle = "Eixos y livres (escalas independentes) para comparar tendências",
+    x = "Mês",
+    y = "Volume"
+  )
+# ```
+```
+```{r}
+# Novamente, usamos facet_wrap, pois colocar dezenas de KMs no mesmo gráfico fica ilegível.
+dados_viz %>%
+  group_by(KM) %>%
+  summarise(Volume = sum(Volume, na.rm = TRUE)) %>%
+  ggplot(aes(x = Mes, y = Volume, color = KM)) +
+  geom_line(linewidth = 0.8) +
+  facet_wrap(~ KM, scales = "free_y") +
+  theme_minimal() +
+  theme(legend.position = "none") +
+  labs(
+    title = "Volume Mensal Desagregado por KM de Coleta",
+    x = "Mês",
+    y = "Volume"
+  )
+```
+```{r}
+## 5. Análise de Sazonalidade e Anomalias Mensais
+
+# ```{r, fig.height=6, fig.width=10}
+dados_viz %>%
+  # Agregar o total da BR para olhar o comportamento geral
+  summarise(Volume_Total = sum(Volume, na.rm = TRUE)) %>%
+  # Criar colunas separadas para o Ano (como categoria) e o Mês nominal
+  mutate(
+    Ano = as.factor(year(Mes)),
+    Mes_Nome = month(Mes, label = TRUE, abbr = TRUE) # Retorna Jan, Fev, Mar...
+  ) %>%
+  ggplot(aes(x = Mes_Nome, y = Volume_Total, color = Ano, group = Ano)) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2) + # Os pontos ajudam a ver a marcação exata do mês
+  scale_y_continuous(labels = scales::label_number(big.mark = ".", decimal.mark = ",")) +
+  theme_minimal() +
+  labs(
+    title = "Sazonalidade Anual - Tráfego Total da BR",
+    subtitle = "Comparação de meses idênticos através dos anos para detecção de anomalias",
+    x = "Mês",
+    y = "Volume Total",
+    color = "Ano"
+  )
+# ```
+```
+Não foi encontrada uma explicação para o comportamento anômalo da diminuição do total de veículos no tráfego da BR-381 em dezembro/2024. 
+
+# Agrupando os dados em uma GTS (Grouped Time Series)
+
+## Criando a base diária a partir da base horária
+
+```{r}
+dados_diarios <- dados_ts %>%
+  filter_index("2021-01-01" ~ .) %>%
+  
+  group_by_key() %>% 
+  
+  # 3. Agrupa o tempo por Dia (muda o índice de Data_Hora para Data)
+  index_by(Data = as_date(Data_Hora)) %>%
+  
+  summarise(Volume = sum(Volume, na.rm = TRUE), .groups = "drop")
+
+dados_diarios
+```
+
+## Criando a GTS
+
+```{r}
+dados_gts <- dados_diarios %>%
+  aggregate_key(
+    KM * Sentido * Tipo_Veiculo, 
+    Volume = sum(Volume, na.rm = TRUE)
+  )
+
+# Inspecionando a estrutura
+dados_gts
+```
+
+## Tráfego Diário Total por Sentido
+```{r}
+library(fabletools)
+
+dados_gts %>%
+  # Abre os dados de 'Sentido', mas olha para o Total geral de 'KM' e 'Tipo_Veiculo'
+  filter(
+    !is_aggregated(Sentido), 
+    is_aggregated(KM),
+    is_aggregated(Tipo_Veiculo)
+  ) %>%
+  autoplot(Volume) +
+  theme_minimal() +
+  scale_y_continuous(labels = scales::label_number(big.mark = ".", decimal.mark = ",")) +
+  labs(
+    title = "Volume Diário de Veículos na BR-381 por Sentido",
+    x = "Data",
+    y = "Volume Total",
+    color = "Sentido"
+  )
+```
+## Tráfego Diário Total por Tipo de Veículo
+
+```{r}
+dados_gts %>%
+  # Abre os dados de 'Tipo_Veiculo', agregando todos os KMs e os dois Sentidos
+  filter(
+    is_aggregated(Sentido), 
+    is_aggregated(KM),
+    !is_aggregated(Tipo_Veiculo)
+  ) %>%
+  autoplot(Volume) +
+  facet_wrap(~ Tipo_Veiculo, scales = "free_y") +
+  theme_minimal() +
+  scale_y_continuous(labels = scales::label_number(big.mark = ".", decimal.mark = ",")) +
+  theme(legend.position = "none") +
+  labs(
+    title = "Volume Diário por Tipo de Veículo",
+    x = "Data",
+    y = "Volume Total"
+  )
+```
+
+```{r}
+dados_brutos
+```
+
+
+
+
+

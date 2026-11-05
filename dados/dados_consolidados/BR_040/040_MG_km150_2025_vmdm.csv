@@ -1,0 +1,8 @@
+﻿;;;;;;Variação do Volume Médio Mensal - VMDm;;;;;;;
+UF;BR;Km;Ano;Latitude;Longitude
+MG;040;150.2;2025;-17.791831;-46.13595
+;;;;;;Classes PNCT;;;;;;;
+Mês;Sentido;Nº de Dias;VMDm;(A) Ônibus/Caminhão de 2 eixos;(B) Ônibus/Caminhão de 3 eixos;(C) Caminhão de 4 eixos;(D) Caminhão de 5 eixos;(E) Caminhão de 6 eixos;(F) Caminhão de 7 eixos;(G) Caminhão de 8 eixos;(H) Caminhão de 9 eixos;(I) Passeio;(J) Motocicleta;(L) Indefinido
+;C;23;1220;87;108;87;73;118;59;3;58;558;26;43
+;D;23;1202;142;110;92;4;2;0;0;0;776;23;53
+Outubro;Total;23;2422;229;218;179;77;120;59;3;58;1334;49;96

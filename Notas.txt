@@ -1,0 +1,72 @@
+09/09
+Não existem dados para o ano de 2020; Trabalhar com dados apenas a partir de 2021 ou usar um modelo matemático para prever os dados de 2020?
+Os dados de 2017 foram coletados por meio de cobertura e possui uma variável inexistente nos outros anos (Faixa). Eliminar essa variável ou deixar todos os outros anos com esse campo vazio/NA?
+Posso somar todos os tipos de veículos para criar a série temporal?
+Arquivos vmdm e vtd serão utilizados?
+Pivotar as categorias de veículos (de A a L) em uma variável Tipo;
+Limpar o nome do tipo, deixando apenas a letra;
+Por qual variável começar? Por exemplo, série temporal de um KM em um sentido específico ou por um tipo de veículo específico
+
+11/09 - reunião com robson
+Concatenar a data e hora, e transformar em data frequência horária
+dados_gts <- dados_limpos |>
+  aggregate_key(Gender * Legal * State, Volume = sum(Volume)/1e3) (talvez não precise dividir por 1000)
+model STL
+testar diferentes métodos de reconciliação
+periods STL = 24, 24 x 7 e 365 x 24
+ETS e ARIMA para previsões junto com STL
+comparar Dynamic harmonic regression c/ STL
+
+14/09
+Não foi encontrada uma explicação para o comportamento anômalo da diminuição do total de veículos no tráfego da BR-381 em dezembro/2024; -> encontrei: apenas um sensor de km estava ativo nesse mês, explicando a queda brusca. resolvi o problema utilizando imputação por mediana sazonal (os valores faltantes são preenchidos pela mediana daquele dia da semana, por exemplo, todas as segundas faltantes são preenchidas pela mediana das segundas que possuem dados)
+
+Testar frequência horária para a GTS, talvez não seja viável pois cada linha da série possui 43.000 observações na frequência horária
+
+O único KM com dados para dez/2024 da BR 381 é o KM 168. Os outros terminam a contagem em 30/11/2024
+KM 168, 280, 373, 443, 504, 657, 701 -> KMs registrados de 2021 a 2025 na BR 381
+398 -> só possui dados de 2023, 2024 e 2025
+842 -> não possui dados de 2021
+
+17/09
+Eliminei os KMs 398 e 842 para modelagem;
+Ao tentar modelar os dados e rodar os modelos, a janela até o ano de 2025 estava dando erro, pois vários KMs iam parando de funcionar ao longo do ano de 2025, gerando missing data. Como também não era possível deixar a janela até dezembro de 2024 devido ao fato de apenas um KM funcionar nesse mês, limitei a janela de 2021 até novembro de 2024.
+Imputação por meio da mediana da sazonal para as lacunas faltantes
+
+dados de treino: janeiro de 2021 até 30 de setembro de 2024
+dados de teste: 61 dias a partir de outubro de 2024 até o fim de novembro
+
+Resultados da modelagem e reconciliação gts para os seguintes métodos: ets, ets bottom up, ets mint e snaive: imagem Metricas1
+
+22/09 - reunião com robson
+identificar problemas com dados de 2024 após o meio do ano e dados faltantes no geral
+imputação por mediana sazonal pegando apenas o dia, é p/ pegar hora também
+diária e semanal num prazo menor com dados por hora (1, 2 semanas), fazer outro modelo com dados por dia para pegar o anual e mensal
+trabalhar validação cruzada deslocando dados de treino e teste
+stretch p/ aumentar o conjunto de dados de treino (tsibble)
+usar slide_tsibble
+criar modelos com frequência horária para testar no laboratório do robson
+
+
+23/09 
+km 701 - não possui dados a partir de junho de 2024, talvez explicando a queda a partir de jun/2024 
+filtrado para não incluir o km 701 - plot foi normalizado
+
+ainda não encontrei o motivo para a queda de fev/2022 - a média diária de veículos por dia é parecida com a de janeiro e fevereiro, portanto a queda provavelmente se deve ao número reduzido de dias no mês
+
+criados os modelos 1- para prever volume diário/semanal com base de dados com frequência horária (fazendo apenas do mês de novembro e prevendo a última semana) 2- modelo com base de dados com frequência diária para prever anual e mensal. agora é necessário aplicar diferentes métodos para avaliar o desempenho.
+
+dezembro de 2023 não possui dados em nenhum dos sensores, por isso apresentou o comportamento constante no plot dos dados diários, pois a imputação pela mediana sazonal mesmo com a frequência horária pegou os mesmos valores para todos os dias (mas se plotar os dados antes do agrupamento diário, é possível ver que não é uma constante)
+
+decidi usar o stretch_tsibbe nos modelos de longo/médio prazo com base diária
+Como funciona: O modelo começa com um tamanho mínimo de treino (ex: dados de 2021 a 2023) e faz uma previsão. Na rodada seguinte, a janela "estica", adicionando um mês de dados reais ao treino, e faz uma nova previsão. A janela de treino sempre cresce.
+Modelos como o ARIMA e o STL com múltipla sazonalidade (anual e semanal) ficam mais espertos quanto mais histórico recebem. Eles precisam de memória de longo prazo para entender que todo feriado de fim de ano aumenta o volume na rodovia.
+e slide_tsibble nos modelos de curto prazo com a base horária
+Como funciona: A janela de treino tem um tamanho fixo (ex: exatas 3 semanas). Quando a janela avança, ela incorpora dados novos na frente e "esquece" os dados mais antigos de trás.
+Por que melhora a métrica: O tráfego horário muda de comportamento rapidamente. O padrão de engarrafamento de terça-feira às 18h de hoje pode ser diferente do padrão de três anos atrás (devido a novas empresas na região, obras, etc.). O slide_tsibble garante que o modelo treine apenas com o comportamento mais recente e atual, descartando padrões obsoletos que poluiriam o cálculo. Além disso, salva a memória RAM do computador ao não acumular milhares de horas.
+
+
+
+
+
+
+ 

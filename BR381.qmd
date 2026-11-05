@@ -1,0 +1,379 @@
+---
+title: "Séries temporais agrupadas para previsão de tráfego em rodovias brasileiras"
+author: "Rafael Rodrigues da Costa Carvalho, Robson Bruno Dutra Pereira"
+format: html
+editor: visual
+---
+
+# 1. Configuração e Bibliotecas
+
+```{r setup, message=FALSE, warning=FALSE}
+library(fpp3)
+library(fs)
+library(readr)
+library(purrr)
+library(stringr)
+```
+
+# 2. Importação e Preparação Inicial
+
+Ativar apenas quando for rodar novos csvs
+
+```{r, eval=FALSE, include=FALSE}
+nova_pasta <- "dados_consolidados/BR_381"
+dir_create(nova_pasta)
+
+dir_ls(path = ".", recurse = TRUE, glob = "*.csv") |> 
+  str_subset("^\\.?/?dados") |> 
+  file_copy(new_path = path(nova_pasta, path_file(.)), overwrite = TRUE)
+```
+
+Mapear arquivos ignorando vmdm e vtd
+
+```{r, message=FALSE, warning=FALSE}
+ler_csv_seguro <- function(caminho) {
+  read_csv2(caminho, skip = 2, show_col_types = FALSE) |> 
+    mutate(caminho_arquivo = caminho)
+}
+
+dados_brutos <- dir_ls("dados_consolidados/BR_381", glob = "*.csv") |> 
+  str_subset("vmdm|vtd", negate = TRUE) |> 
+  map_dfr(ler_csv_seguro)
+```
+
+Limpeza e Pivotagem
+
+```{r}
+dados_limpos <- dados_brutos |> 
+  select(-any_of(c("faixa", "Faixa", "FAIXA"))) |> 
+  mutate(nome_arquivo = str_remove(basename(caminho_arquivo), "\\.csv")) |> 
+  separate(col = nome_arquivo, into = c("BR", "Estado", "KM", "Ano_Arquivo"), sep = "_", extra = "drop") |> 
+  mutate(
+    KM = str_remove(KM, "km"),
+    Data = dmy(Data)
+  ) |> 
+  select(-caminho_arquivo) |> 
+  pivot_longer(
+    cols = `(A) Ônibus/Caminhão de 2 eixos`:`(L) Indefinido`, 
+    names_to = "Tipo_Veiculo", 
+    values_to = "Volume"
+  ) |> 
+  mutate(Tipo_Veiculo = str_extract(Tipo_Veiculo, "(?<=\\()[A-Z](?=\\))"))
+```
+
+# 3. Estruturação Temporal e Tratamento (Imputação)
+
+
+Conversão para Tsibble (Horário)
+
+```{r}
+dados_ts <- dados_limpos |> 
+  mutate(Data_Hora = make_datetime(year(Data), month(Data), day(Data), as.numeric(Hora))) |> 
+  select(-Data, -Hora, -Ano_Arquivo) |> 
+  distinct() |> 
+  group_by(Estado, BR, KM, Sentido, Tipo_Veiculo, Data_Hora) |> 
+  summarise(Volume = sum(Volume, na.rm = TRUE), .groups = "drop") |> 
+  as_tsibble(index = Data_Hora, key = c(Estado, BR, KM, Sentido, Tipo_Veiculo))
+```
+
+imputação horária e conversão dos dados para diários. filtrei os kms que estavam com sensores defeituosos, filtrei até novembro de 2024 (dezembro de 2024 estava apresentando muitos dados faltantes e 2025 também). fiz imputação sazonal pelo dia da semana e horário.
+
+```{r}
+dados_diarios <- dados_ts |> 
+  filter(!KM %in% c("398", "842", "701")) |> 
+  filter_index("2021-11-01" ~ "2024-11-30") |> 
+  fill_gaps(Volume = NA) |> 
+  mutate(
+    Dia_Semana = wday(Data_Hora),
+    Hora_Dia = hour(Data_Hora)
+  ) |> 
+  group_by_key() |> 
+  group_by(Dia_Semana, Hora_Dia, .add = TRUE) |> 
+  mutate(
+    Volume_Tipico = median(Volume, na.rm = TRUE),
+    Volume = if_else(is.na(Volume), Volume_Tipico, Volume),
+    Volume = if_else(is.na(Volume), 0, Volume) 
+  ) |> 
+  ungroup() |> 
+  select(-Dia_Semana, -Hora_Dia, -Volume_Tipico) |> 
+  group_by_key() |> 
+  index_by(Data = as_date(Data_Hora)) |> 
+  summarise(Volume = sum(Volume, na.rm = TRUE), .groups = "drop")
+```
+
+# 4. Análise Exploratória
+
+base agregada mensal para visualização nos plots
+
+```{r}
+dados_viz <- dados_diarios |> 
+  group_by_key() |> 
+  index_by(Mes = ~ yearmonth(.)) |> 
+  summarise(Volume = sum(Volume, na.rm = TRUE), .groups = "drop")
+```
+
+## 4.1 Tráfego Total e Por Sentido
+
+```{r}
+dados_viz |> 
+  summarise(Volume = sum(Volume, na.rm = TRUE)) |> 
+  autoplot(Volume) +
+  labs(title = "Tráfego Total Mensal - BR-381", y = "Volume Total")
+
+dados_viz |> 
+  group_by(Sentido) |> 
+  summarise(Volume = sum(Volume, na.rm = TRUE)) |> 
+  autoplot(Volume) +
+  labs(title = "Tráfego Mensal por Sentido", y = "Volume")
+
+dados_viz |> 
+  group_by(Tipo_Veiculo) |> 
+  summarise(Volume = sum(Volume, na.rm = TRUE)) |> 
+  autoplot(Volume) +
+  facet_wrap(vars(Tipo_Veiculo), scales = "free_y") + 
+  theme(legend.position = "none") +
+  labs(title = "Tráfego Mensal por Tipo de Veículo", y = "Volume")
+```
+
+## 4.2 Análise de Sazonalidade Anual
+
+```{r, fig.height=6, fig.width=10}
+dados_viz |> 
+  filter(year(Mes) != 2021) |> 
+  summarise(Volume = sum(Volume, na.rm = TRUE)) |> 
+  gg_season(Volume, labels = "both") +
+  labs(title = "Sazonalidade Anual - Tráfego Total", y = "Volume Total")
+```
+
+# 5. Estruturação Hierárquica (GTS)
+
+cruzando as variáveis para obter a série temporal agrupada
+
+```{r}
+dados_gts <- dados_diarios |> 
+  aggregate_key(KM * Sentido * Tipo_Veiculo, Volume = sum(Volume, na.rm = TRUE))
+```
+
+```{r, fig.height=5, fig.width=9}
+dados_gts |> 
+  filter(!is_aggregated(Sentido), is_aggregated(KM), is_aggregated(Tipo_Veiculo)) |> 
+  autoplot(Volume) +
+  labs(title = "Volume Diário por Sentido (GTS)", y = "Volume Total")
+
+dados_gts |> 
+  filter(is_aggregated(Sentido), is_aggregated(KM), !is_aggregated(Tipo_Veiculo)) |> 
+  autoplot(Volume) +
+  facet_wrap(vars(Tipo_Veiculo), scales = "free_y") +
+  theme(legend.position = "none") +
+  labs(title = "Volume Diário por Tipo de Veículo (GTS)", y = "Volume Total")
+```
+
+# 6. Modelagem e Reconciliação (Sem Validação Cruzada)
+
+modelagens sem validação cruzada (sem stretch_tsibble e slide_tsibble)
+
+## 6.1 Modelagem Diária (Médio/Longo Prazo)
+
+separação de treino até setembro/2024 e testando diferentes modelos e métodos de reconciliação
+
+```{r}
+treino_diario <- dados_gts |> filter_index(. ~ "2024-09-30")
+
+fit_diario <- treino_diario |> 
+  model(
+    ets = ETS(Volume),
+    stl_ets = decomposition_model(
+      STL(Volume ~ season(period = 7) + season(period = 365), robust = TRUE),
+      ETS(season_adjust ~ season("N"))
+    ),
+    dhr = ARIMA(Volume ~ fourier(period = 7, K = 3) + fourier(period = 365, K = 5) + PDQ(0,0,0))
+  ) |> 
+  reconcile(
+    ets_bu = bottom_up(ets),
+    ets_mint = min_trace(ets, method = "mint_shrink"),
+    ets_wls = min_trace(ets, method = "wls_var")
+  )
+```
+
+previsão para outubro e novembro (61 dias) e métricas
+
+```{r}
+fc_diario <- fit_diario |> forecast(h = "61 days")
+
+metricas_diarias <- fc_diario |> accuracy(dados_gts)
+
+metricas_diarias |> 
+  filter(is_aggregated(KM), is_aggregated(Sentido), is_aggregated(Tipo_Veiculo)) |> 
+  select(.model, RMSE, MAE, MAPE) |> 
+  arrange(RMSE)
+```
+
+plotando os modelos
+
+```{r}
+fc_diario |> 
+  filter(is_aggregated(KM), is_aggregated(Sentido), is_aggregated(Tipo_Veiculo)) |> 
+  autoplot(dados_gts |> filter_index("2024-09-01" ~ "2024-11-30"), level = NULL) +
+  labs(
+    title = "Previsão vs Realidade - Tráfego Total Diário",
+    subtitle = "Outubro e Novembro de 2024 (Médio Prazo)",
+    x = "Data",
+    y = "Volume Total"
+  )
+```
+
+## 6.2 Modelagem Horária (Curto Prazo)
+
+Tratamento e Criação da GTS Horária focada apenas no mês de novembro de 2024. Revela horas faltantes no tsibble e preenche com 0.
+
+```{r}
+dados_gts_horario <- dados_ts |> 
+  filter(!KM %in% c("398", "842", "701")) |> 
+  filter_index("2024-11-01" ~ "2024-11-30") |> 
+  fill_gaps(Volume = 0) |> 
+  aggregate_key(KM * Sentido * Tipo_Veiculo, Volume = sum(Volume, na.rm = TRUE))
+```
+
+Separação de Treino (até 23 de Novembro) e Teste (última semana do mês)
+
+```{r}
+treino_horario <- dados_gts_horario |> filter_index(. ~ "2024-11-23")
+teste_horario <- dados_gts_horario |> filter_index("2024-11-24" ~ .)
+```
+
+modelagem e reconciliação horária
+
+```{r}
+fit_horario <- treino_horario |> 
+  model(
+    snaive = SNAIVE(Volume ~ lag("week")),
+    stl_ets = decomposition_model(
+      STL(Volume ~ season(period = 24) + season(period = 168), robust = TRUE),
+      ETS(season_adjust ~ season("N"))
+    )
+  ) |> 
+  reconcile(
+    mint = min_trace(stl_ets, method = "mint_shrink")
+  )
+```
+
+previsão 1 semana a frente e visualização do topo
+
+```{r}
+fc_horario <- fit_horario |> forecast(h = "168 hours")
+
+metricas_horarias <- fc_horario |> accuracy(dados_gts_horario)
+
+metricas_horarias |> 
+  filter(is_aggregated(KM), is_aggregated(Sentido), is_aggregated(Tipo_Veiculo)) |> 
+  select(.model, RMSE, MAE, MAPE) |> 
+  arrange(RMSE)
+```
+
+plotando os modelos
+
+```{r}
+fc_horario |> 
+  filter(
+    is_aggregated(KM), 
+    is_aggregated(Sentido), 
+    is_aggregated(Tipo_Veiculo)
+  ) |> 
+  autoplot(
+    dados_gts_horario |> filter_index("2024-11-17" ~ "2024-11-30"), 
+    level = NULL, 
+    linewidth = 1
+  ) +
+  theme_minimal() +
+  scale_y_continuous(labels = scales::comma) +
+  labs(
+    title = "Previsão vs Realidade - Tráfego Horário Total",
+    subtitle = "Última semana de Novembro de 2024 (Curto Prazo)",
+    x = "Data/Hora",
+    y = "Volume Total",
+    color = "Modelo"
+  )
+```
+
+# 7. Modelagem e Reconciliação (Com Validação Cruzada)
+
+## 7.1 Modelagem Diária (Médio/Longo Prazo com Janela Expansiva)
+
+size 730 = 2 anos e step = 90 (1 trimestre, porém testar com 30 no pc da produção)
+remover filtro ao rodar no computador da produção, só coloquei pra conseguir rodar no meu
+
+```{r}
+dados_cv_leve <- dados_gts |> 
+
+  filter(is_aggregated(Tipo_Veiculo)) |> 
+  # Salta a janela de 90 em 90 dias para gerar menos cortes simultâneos
+  stretch_tsibble(.init = 730, .step = 90)
+```
+
+```{r}
+fit_diario_cv <- dados_cv_leve |> 
+  model(
+    stl_ets = decomposition_model(
+      STL(Volume ~ season(period = 7) + season(period = 365), robust = TRUE),
+      ETS(season_adjust ~ season("N"))
+    )
+  ) |> 
+  reconcile(
+    mint = min_trace(stl_ets, method = "mint_shrink")
+  )
+```
+
+Previsões de médio prazo (61 dias) para cada um dos blocos gerados
+
+```{r}
+fc_diario_cv <- fit_diario_cv |> forecast(h = "61 days")
+
+metricas_diarias_cv <- fc_diario_cv |> 
+  accuracy(dados_gts |> filter(is_aggregated(Tipo_Veiculo)))
+
+metricas_diarias_cv |> 
+  filter(is_aggregated(KM), is_aggregated(Sentido)) |> 
+  select(.model, RMSE, MAE, MAPE) |> 
+  arrange(RMSE)
+```
+
+## 7.2 Modelagem Horária (curto prazo usando stretch)
+
+size 504 horas: 3 semanas e step 24 = 1 dia
+
+```{r}
+dados_horario_cv <- dados_gts_horario |> 
+  slide_tsibble(.size = 504, .step = 24)
+```
+
+modelagem e reconciliação
+
+```{r}
+fit_horario_cv <- dados_horario_cv |> 
+  model(
+    snaive = SNAIVE(Volume ~ lag("week")),
+    stl_ets = decomposition_model(
+      STL(Volume ~ season(period = 24) + season(period = 168), robust = TRUE),
+      ETS(season_adjust ~ season("N"))
+    )
+  ) |> 
+  reconcile(
+    mint = min_trace(stl_ets, method = "mint_shrink")
+  )
+```
+
+previsão de 1 semana a frente (168 horas)
+
+```{r}
+fc_horario_cv <- fit_horario_cv |> forecast(h = "168 hours")
+
+metricas_horarias_cv <- fc_horario_cv |> accuracy(dados_gts_horario)
+
+metricas_horarias_cv |> 
+  filter(is_aggregated(KM), is_aggregated(Sentido), is_aggregated(Tipo_Veiculo)) |> 
+  select(.model, RMSE, MAE, MAPE) |> 
+  arrange(RMSE)
+```
+
+
+
