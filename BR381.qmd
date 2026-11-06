@@ -13,6 +13,7 @@ library(fs)
 library(readr)
 library(purrr)
 library(stringr)
+library(future)
 ```
 
 # 2. Importação e Preparação Inicial
@@ -20,7 +21,7 @@ library(stringr)
 Ativar apenas quando for rodar novos csvs
 
 ```{r, eval=FALSE, include=FALSE}
-nova_pasta <- "dados_consolidados/BR_381"
+nova_pasta <- "Dados/dados_consolidados/BR_381"
 dir_create(nova_pasta)
 
 dir_ls(path = ".", recurse = TRUE, glob = "*.csv") |> 
@@ -36,7 +37,7 @@ ler_csv_seguro <- function(caminho) {
     mutate(caminho_arquivo = caminho)
 }
 
-dados_brutos <- dir_ls("dados_consolidados/BR_381", glob = "*.csv") |> 
+dados_brutos <- dir_ls("Dados/dados_consolidados/BR_381", glob = "*.csv") |> 
   str_subset("vmdm|vtd", negate = TRUE) |> 
   map_dfr(ler_csv_seguro)
 ```
@@ -63,7 +64,6 @@ dados_limpos <- dados_brutos |>
 
 # 3. Estruturação Temporal e Tratamento (Imputação)
 
-
 Conversão para Tsibble (Horário)
 
 ```{r}
@@ -76,7 +76,7 @@ dados_ts <- dados_limpos |>
   as_tsibble(index = Data_Hora, key = c(Estado, BR, KM, Sentido, Tipo_Veiculo))
 ```
 
-imputação horária e conversão dos dados para diários. filtrei os kms que estavam com sensores defeituosos, filtrei até novembro de 2024 (dezembro de 2024 estava apresentando muitos dados faltantes e 2025 também). fiz imputação sazonal pelo dia da semana e horário.
+imputação horária e conversão dos dados para diários. filtrei os kms que estavam com sensores defeituosos, filtrei até novembro de 2024 (dezembro de 2024 estava apresentando muitos dados faltantes e 2025 também). fiz imputação sazonal pelo dia da semana e horário para as lacunas.
 
 ```{r}
 dados_diarios <- dados_ts |> 
@@ -299,28 +299,41 @@ fc_horario |>
 
 ## 7.1 Modelagem Diária (Médio/Longo Prazo com Janela Expansiva)
 
-size 730 = 2 anos e step = 90 (1 trimestre, porém testar com 30 no pc da produção)
-remover filtro ao rodar no computador da produção, só coloquei pra conseguir rodar no meu
+size 730 = 2 anos e step = 90 (1 trimestre, porém testar com 30 no pc da produção) remover filtro ao rodar no computador da produção, só coloquei pra conseguir rodar no meu
 
 ```{r}
-dados_cv_leve <- dados_gts |> 
-
-  filter(is_aggregated(Tipo_Veiculo)) |> 
+dados_cv <- dados_gts |> 
   # Salta a janela de 90 em 90 dias para gerar menos cortes simultâneos
-  stretch_tsibble(.init = 730, .step = 90)
+  stretch_tsibble(.init = 730, .step = 30)
 ```
 
 ```{r}
-fit_diario_cv <- dados_cv_leve |> 
+
+plan(multisession, workers = availableCores() - 1)
+
+fit_diario_cv <- dados_cv |> 
   model(
-    stl_ets = decomposition_model(
+    base_ets = ETS(Volume),
+    base_stl = decomposition_model(
       STL(Volume ~ season(period = 7) + season(period = 365), robust = TRUE),
       ETS(season_adjust ~ season("N"))
-    )
+    ),
+    base_dhr = ARIMA(Volume ~ fourier(period = 7, K = 3) + fourier(period = 365, K = 5) + PDQ(0,0,0))
   ) |> 
   reconcile(
-    mint = min_trace(stl_ets, method = "mint_shrink")
-  )
+    ets_bu = bottom_up(base_ets),
+    ets_wls_s = min_trace(base_ets, method = "wls_struct"),
+    ets_wls_v = min_trace(base_ets, method = "wls_var"),
+    
+    stl_bu = bottom_up(base_stl),
+    stl_wls_s = min_trace(base_stl, method = "wls_struct"),
+    stl_wls_v = min_trace(base_stl, method = "wls_var"),
+    
+    dhr_bu = bottom_up(base_dhr),
+    dhr_wls_s = min_trace(base_dhr, method = "wls_struct"),
+    dhr_wls_v = min_trace(base_dhr, method = "wls_var"))
+    
+    plan(sequential)
 ```
 
 Previsões de médio prazo (61 dias) para cada um dos blocos gerados
@@ -328,13 +341,39 @@ Previsões de médio prazo (61 dias) para cada um dos blocos gerados
 ```{r}
 fc_diario_cv <- fit_diario_cv |> forecast(h = "61 days")
 
-metricas_diarias_cv <- fc_diario_cv |> 
-  accuracy(dados_gts |> filter(is_aggregated(Tipo_Veiculo)))
+metricas_diarias_cv <- fc_diario_cv |> accuracy(dados_gts)
 
+# ranking geral
 metricas_diarias_cv |> 
-  filter(is_aggregated(KM), is_aggregated(Sentido)) |> 
-  select(.model, RMSE, MAE, MAPE) |> 
-  arrange(RMSE)
+  group_by(.model) |> 
+  summarise(
+    RMSE_Medio = mean(RMSE, na.rm = TRUE), 
+    MAE_Medio = mean(MAE, na.rm = TRUE)
+  ) |> 
+  arrange(RMSE_Medio)
+
+# ranking detalhado por nivel hierarquico
+metricas_diarias_cv |> 
+  mutate(
+    Nivel_Hierarquico = case_when(
+      is_aggregated(KM) & is_aggregated(Sentido) & is_aggregated(Tipo_Veiculo) ~ "1. Topo (Total Geral)",
+      !is_aggregated(KM) & is_aggregated(Sentido) & is_aggregated(Tipo_Veiculo) ~ "2. Apenas por KM",
+      is_aggregated(KM) & !is_aggregated(Sentido) & is_aggregated(Tipo_Veiculo) ~ "3. Apenas por Sentido",
+      is_aggregated(KM) & is_aggregated(Sentido) & !is_aggregated(Tipo_Veiculo) ~ "4. Apenas por Tipo de Veículo",
+      !is_aggregated(KM) & !is_aggregated(Sentido) & is_aggregated(Tipo_Veiculo) ~ "5. KM x Sentido",
+      !is_aggregated(KM) & is_aggregated(Sentido) & !is_aggregated(Tipo_Veiculo) ~ "6. KM x Tipo de Veículo",
+      is_aggregated(KM) & !is_aggregated(Sentido) & !is_aggregated(Tipo_Veiculo) ~ "7. Sentido x Tipo de Veículo",
+      !is_aggregated(KM) & !is_aggregated(Sentido) & !is_aggregated(Tipo_Veiculo) ~ "8. Base (KM x Sentido x Tipo)"
+    )
+  ) |> 
+  group_by(Nivel_Hierarquico, .model) |> 
+  summarise(
+    RMSE_Medio = mean(RMSE, na.rm = TRUE), 
+    MAE_Medio = mean(MAE, na.rm = TRUE),
+    .groups = "drop"
+  ) |> 
+  arrange(Nivel_Hierarquico, RMSE_Medio) |> 
+  print(n = Inf) # garante que o console exiba todas as linhas
 ```
 
 ## 7.2 Modelagem Horária (curto prazo usando stretch)
@@ -349,17 +388,28 @@ dados_horario_cv <- dados_gts_horario |>
 modelagem e reconciliação
 
 ```{r}
+
+plan(multisession, workers = availableCores() - 1) # aumentar o numero de nucleos do processador
+
 fit_horario_cv <- dados_horario_cv |> 
   model(
-    snaive = SNAIVE(Volume ~ lag("week")),
-    stl_ets = decomposition_model(
+    base_snaive = SNAIVE(Volume ~ lag("week")),
+    base_stl = decomposition_model(
       STL(Volume ~ season(period = 24) + season(period = 168), robust = TRUE),
       ETS(season_adjust ~ season("N"))
     )
   ) |> 
   reconcile(
-    mint = min_trace(stl_ets, method = "mint_shrink")
+    snaive_bu = bottom_up(base_snaive),
+    snaive_wls_s = min_trace(base_snaive, method = "wls_struct"),
+    snaive_wls_v = min_trace(base_snaive, method = "wls_var"),
+    
+    stl_bu = bottom_up(base_stl),
+    stl_wls_s = min_trace(base_stl, method = "wls_struct"),
+    stl_wls_v = min_trace(base_stl, method = "wls_var")
   )
+
+plan(sequential)
 ```
 
 previsão de 1 semana a frente (168 horas)
@@ -369,11 +419,32 @@ fc_horario_cv <- fit_horario_cv |> forecast(h = "168 hours")
 
 metricas_horarias_cv <- fc_horario_cv |> accuracy(dados_gts_horario)
 
+# ranking geral dos modelos horários
 metricas_horarias_cv |> 
-  filter(is_aggregated(KM), is_aggregated(Sentido), is_aggregated(Tipo_Veiculo)) |> 
-  select(.model, RMSE, MAE, MAPE) |> 
-  arrange(RMSE)
+  group_by(.model) |> 
+  summarise(RMSE_Medio = mean(RMSE, na.rm = TRUE), MAE_Medio = mean(MAE, na.rm = TRUE)) |> 
+  arrange(RMSE_Medio)
+
+# ranking detalhado por nivel hierarquico
+metricas_horarias_cv |> 
+  mutate(
+    Nivel_Hierarquico = case_when(
+      is_aggregated(KM) & is_aggregated(Sentido) & is_aggregated(Tipo_Veiculo) ~ "1. Topo (Total Geral)",
+      !is_aggregated(KM) & is_aggregated(Sentido) & is_aggregated(Tipo_Veiculo) ~ "2. Apenas por KM",
+      is_aggregated(KM) & !is_aggregated(Sentido) & is_aggregated(Tipo_Veiculo) ~ "3. Apenas por Sentido",
+      is_aggregated(KM) & is_aggregated(Sentido) & !is_aggregated(Tipo_Veiculo) ~ "4. Apenas por Tipo de Veículo",
+      !is_aggregated(KM) & !is_aggregated(Sentido) & is_aggregated(Tipo_Veiculo) ~ "5. KM x Sentido",
+      !is_aggregated(KM) & is_aggregated(Sentido) & !is_aggregated(Tipo_Veiculo) ~ "6. KM x Tipo de Veículo",
+      is_aggregated(KM) & !is_aggregated(Sentido) & !is_aggregated(Tipo_Veiculo) ~ "7. Sentido x Tipo de Veículo",
+      !is_aggregated(KM) & !is_aggregated(Sentido) & !is_aggregated(Tipo_Veiculo) ~ "8. Base (KM x Sentido x Tipo)"
+    )
+  ) |> 
+  group_by(Nivel_Hierarquico, .model) |> 
+  summarise(
+    RMSE_Medio = mean(RMSE, na.rm = TRUE), 
+    MAE_Medio = mean(MAE, na.rm = TRUE),
+    .groups = "drop"
+  ) |> 
+  arrange(Nivel_Hierarquico, RMSE_Medio) |> 
+  print(n = Inf) # garante que o console exiba todas as linhas
 ```
-
-
-
