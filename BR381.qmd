@@ -14,6 +14,9 @@ library(readr)
 library(purrr)
 library(stringr)
 library(future)
+library(ggplot2)
+library(forcats)
+library(dplyr)
 ```
 
 # 2. Importação e Preparação Inicial
@@ -303,8 +306,7 @@ size 730 = 2 anos e step = 90 (1 trimestre, porém testar com 30 no pc da produ�
 
 ```{r}
 dados_cv <- dados_gts |> 
-  # Salta a janela de 90 em 90 dias para gerar menos cortes simultâneos
-  stretch_tsibble(.init = 730, .step = 30)
+  stretch_tsibble(.init = 730, .step = 90)
 ```
 
 ```{r}
@@ -318,20 +320,21 @@ fit_diario_cv <- dados_cv |>
       STL(Volume ~ season(period = 7) + season(period = 365), robust = TRUE),
       ETS(season_adjust ~ season("N"))
     ),
-    base_dhr = ARIMA(Volume ~ fourier(period = 7, K = 3) + fourier(period = 365, K = 5) + PDQ(0,0,0))
+    # base_dhr = ARIMA(Volume ~ fourier(period = 7, K = 3) + fourier(period = 365, K = 5) + PDQ(0,0,0))
   ) |> 
   reconcile(
     ets_bu = bottom_up(base_ets),
     ets_wls_s = min_trace(base_ets, method = "wls_struct"),
     ets_wls_v = min_trace(base_ets, method = "wls_var"),
     
-    stl_bu = bottom_up(base_stl),
-    stl_wls_s = min_trace(base_stl, method = "wls_struct"),
-    stl_wls_v = min_trace(base_stl, method = "wls_var"),
+    # stl_bu = bottom_up(base_stl),
+    # stl_wls_s = min_trace(base_stl, method = "wls_struct"),
+    # stl_wls_v = min_trace(base_stl, method = "wls_var"),
     
-    dhr_bu = bottom_up(base_dhr),
-    dhr_wls_s = min_trace(base_dhr, method = "wls_struct"),
-    dhr_wls_v = min_trace(base_dhr, method = "wls_var"))
+    # dhr_bu = bottom_up(base_dhr),
+    # dhr_wls_s = min_trace(base_dhr, method = "wls_struct"),
+    # dhr_wls_v = min_trace(base_dhr, method = "wls_var")
+  )
     
     plan(sequential)
 ```
@@ -339,7 +342,8 @@ fit_diario_cv <- dados_cv |>
 Previsões de médio prazo (61 dias) para cada um dos blocos gerados
 
 ```{r}
-fc_diario_cv <- fit_diario_cv |> forecast(h = "61 days")
+
+fc_diario_cv <- fit_diario_cv |> forecast(h = "30 days")
 
 metricas_diarias_cv <- fc_diario_cv |> accuracy(dados_gts)
 
@@ -376,13 +380,88 @@ metricas_diarias_cv |>
   print(n = Inf) # garante que o console exiba todas as linhas
 ```
 
+Plot de Gráfico de Barras Agrupadas
+
+```{r}
+metricas_diarias_cv |> 
+  group_by(Nivel_Hierarquico, .model) |> 
+  summarise(RMSE_Medio = mean(RMSE, na.rm = TRUE), .groups = "drop") |> 
+  ggplot(aes(x = RMSE_Medio, y = fct_rev(Nivel_Hierarquico), fill = .model)) +
+  geom_col(position = position_dodge(width = 0.8), width = 0.7) +
+  theme_minimal() +
+  labs(
+    title = "Comparação de Modelos por Nível Hierárquico",
+    subtitle = "RMSE Médio em Validação Cruzada (Médio Prazo)",
+    x = "RMSE Médio",
+    y = "Nível de Agregação",
+    fill = "Modelo / Reconciliação"
+  ) +
+  theme(legend.position = "bottom")
+```
+
+Gráfico de Linhas por Iteração do Stretch Tsibble
+
+```{r}
+metricas_por_janela <- fc_diario_cv |> 
+  group_by(.id, .model) |> 
+  accuracy(dados_gts) |> 
+  mutate(
+    Nivel_Hierarquico = case_when(
+      is_aggregated(KM) & is_aggregated(Sentido) & is_aggregated(Tipo_Veiculo) ~ "1. Topo (Total Geral)",
+      !is_aggregated(KM) & is_aggregated(Sentido) & is_aggregated(Tipo_Veiculo) ~ "2. KM",
+      is_aggregated(KM) & !is_aggregated(Sentido) & is_aggregated(Tipo_Veiculo) ~ "3. Sentido",
+      is_aggregated(KM) & is_aggregated(Sentido) & !is_aggregated(Tipo_Veiculo) ~ "4. Tipo de Veículo",
+      !is_aggregated(KM) & !is_aggregated(Sentido) & is_aggregated(Tipo_Veiculo) ~ "5. KM x Sentido",
+      !is_aggregated(KM) & is_aggregated(Sentido) & !is_aggregated(Tipo_Veiculo) ~ "6. KM x Tipo de Veículo",
+      is_aggregated(KM) & !is_aggregated(Sentido) & !is_aggregated(Tipo_Veiculo) ~ "7. Sentido x Tipo de Veículo",
+      !is_aggregated(KM) & !is_aggregated(Sentido) & !is_aggregated(Tipo_Veiculo) ~ "8. Base"
+    )
+  ) |> 
+  group_by(.id, .model, Nivel_Hierarquico) |> 
+  summarise(RMSE = mean(RMSE, na.rm = TRUE), .groups = "drop")
+
+metricas_por_janela |> 
+  filter(Nivel_Hierarquico %in% c("1. Topo (Total Geral)", "4. Tipo de Veículo", "8. Base")) |> 
+  ggplot(aes(x = .id, y = RMSE, color = .model)) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2) +
+  facet_wrap(vars(Nivel_Hierarquico), scales = "free_y", ncol = 1) +
+  theme_minimal() +
+  labs(
+    title = "Evolução do Erro ao Longo das Janelas de Validação Cruzada",
+    subtitle = "Performance em cada avanço do stretch_tsibble",
+    x = "ID da Janela de Teste (.id)",
+    y = "RMSE",
+    color = "Modelo"
+  )
+```
+
+Boxplot de variância
+
+```{r}
+metricas_por_janela |> 
+  filter(Nivel_Hierarquico %in% c("1. Topo (Total Geral)", "8. Base")) |> 
+  ggplot(aes(x = .model, y = RMSE, fill = .model)) +
+  geom_boxplot(alpha = 0.7, outlier.color = "red", outlier.size = 2) +
+  facet_wrap(vars(Nivel_Hierarquico), scales = "free_y", ncol = 2) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1), legend.position = "none") +
+  labs(
+    title = "Estabilidade dos Modelos ao Longo do Tempo (Boxplot)",
+    subtitle = "Dispersão do RMSE nas diferentes janelas de teste",
+    x = "Modelo",
+    y = "RMSE"
+  )
+```
+
+
 ## 7.2 Modelagem Horária (curto prazo usando stretch)
 
 size 504 horas: 3 semanas e step 24 = 1 dia
 
 ```{r}
 dados_horario_cv <- dados_gts_horario |> 
-  slide_tsibble(.size = 504, .step = 24)
+  slide_tsibble(.size = 504, .step = 168)
 ```
 
 modelagem e reconciliação
@@ -396,7 +475,8 @@ fit_horario_cv <- dados_horario_cv |>
     base_snaive = SNAIVE(Volume ~ lag("week")),
     base_stl = decomposition_model(
       STL(Volume ~ season(period = 24) + season(period = 168), robust = TRUE),
-      ETS(season_adjust ~ season("N"))
+      ETS(season_adjust ~ season("N")),
+      base_stlf = ARIMA(Volume ~ fourier(period = 24 , K = 5) + fourier(period = 168, K = 5) + PDQ(0,0,0))
     )
   ) |> 
   reconcile(
@@ -412,21 +492,29 @@ fit_horario_cv <- dados_horario_cv |>
 plan(sequential)
 ```
 
-previsão de 1 semana a frente (168 horas)
+previsão de 1 dia a frente (24 horas) e métricas
 
 ```{r}
-fc_horario_cv <- fit_horario_cv |> forecast(h = "168 hours")
 
-metricas_horarias_cv <- fc_horario_cv |> accuracy(dados_gts_horario)
+# 2. Reduza o horizonte de previsão para otimizar o rolling window
+fc_horario_cv <- fit_horario_cv |> forecast(h = "24 hours")
+
+# 3. Cruze as métricas apenas com os dados do período de teste
+metricas_horarias_cv <- fc_horario_cv |> 
+  accuracy(dados_gts_horario |> filter_index("2024-11-01" ~ "2024-11-30"))
+
 
 # ranking geral dos modelos horários
 metricas_horarias_cv |> 
   group_by(.model) |> 
-  summarise(RMSE_Medio = mean(RMSE, na.rm = TRUE), MAE_Medio = mean(MAE, na.rm = TRUE)) |> 
+  summarise(
+    RMSE_Medio = mean(RMSE, na.rm = TRUE), 
+    MAE_Medio = mean(MAE, na.rm = TRUE)
+  ) |> 
   arrange(RMSE_Medio)
 
-# ranking detalhado por nivel hierarquico
-metricas_horarias_cv |> 
+# ranking detalhado por nivel hierarquico (com o typo corrigido)
+metricas_horarias_cv <- metricas_horarias_cv |> 
   mutate(
     Nivel_Hierarquico = case_when(
       is_aggregated(KM) & is_aggregated(Sentido) & is_aggregated(Tipo_Veiculo) ~ "1. Topo (Total Geral)",
@@ -446,5 +534,87 @@ metricas_horarias_cv |>
     .groups = "drop"
   ) |> 
   arrange(Nivel_Hierarquico, RMSE_Medio) |> 
-  print(n = Inf) # garante que o console exiba todas as linhas
+  print(n = Inf)
+```
+
+Plot de Gráfico de Barras Agrupadas
+
+```{r}
+metricas_horarias_cv |> 
+  # 1. Remove classes complexas do fable para evitar conflitos no ggplot
+  as_tibble() |> 
+  group_by(Nivel_Hierarquico, .model) |> 
+  summarise(RMSE_Medio = mean(RMSE, na.rm = TRUE), .groups = "drop") |> 
+  # 2. Mapeamento clássico: Categórico no X, Numérico no Y
+  ggplot(aes(x = .model, y = RMSE_Medio, fill = .model)) +
+  geom_col() +
+  # 3. Força a rotação do gráfico com segurança
+  coord_flip() +
+  # 4. Usa scales = "free" para liberar os eixos em cada um dos 8 quadros
+  facet_wrap(vars(Nivel_Hierarquico), scales = "free", ncol = 2) + 
+  theme_minimal() +
+  labs(
+    title = "Comparação de Modelos por Nível Hierárquico",
+    subtitle = "RMSE Médio em Validação Cruzada (Curto Prazo)",
+    x = "Modelo / Reconciliação",
+    y = "RMSE Médio (Escala Livre por Nível)"
+  ) +
+  theme(legend.position = "none")
+```
+
+Gráfico de Linhas por Iteração do Stretch Slide
+
+```{r}
+metricas_por_janela_h <- fc_horario_cv |> 
+  # CORREÇÃO: Agrupar apenas por .id antes do accuracy
+  group_by(.id) |> 
+  accuracy(dados_gts_horario) |> 
+  mutate(
+    Nivel_Hierarquico = case_when(
+      is_aggregated(KM) & is_aggregated(Sentido) & is_aggregated(Tipo_Veiculo) ~ "1. Topo (Total Geral)",
+      !is_aggregated(KM) & is_aggregated(Sentido) & is_aggregated(Tipo_Veiculo) ~ "2. KM",
+      is_aggregated(KM) & !is_aggregated(Sentido) & is_aggregated(Tipo_Veiculo) ~ "3. Sentido",
+      is_aggregated(KM) & is_aggregated(Sentido) & !is_aggregated(Tipo_Veiculo) ~ "4. Tipo de Veículo",
+      !is_aggregated(KM) & !is_aggregated(Sentido) & is_aggregated(Tipo_Veiculo) ~ "5. KM x Sentido",
+      !is_aggregated(KM) & is_aggregated(Sentido) & !is_aggregated(Tipo_Veiculo) ~ "6. KM x Tipo de Veículo",
+      is_aggregated(KM) & !is_aggregated(Sentido) & !is_aggregated(Tipo_Veiculo) ~ "7. Sentido x Tipo de Veículo",
+      !is_aggregated(KM) & !is_aggregated(Sentido) & !is_aggregated(Tipo_Veiculo) ~ "8. Base"
+    )
+  ) |> 
+  # Aqui sim podemos agrupar por .id e .model para tirar a média dos níveis
+  group_by(.id, .model, Nivel_Hierarquico) |> 
+  summarise(RMSE = mean(RMSE, na.rm = TRUE), .groups = "drop")
+
+metricas_por_janela_h |> 
+  filter(Nivel_Hierarquico %in% c("1. Topo (Total Geral)", "4. Tipo de Veículo", "8. Base")) |> 
+  ggplot(aes(x = .id, y = RMSE, color = .model)) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2) +
+  facet_wrap(vars(Nivel_Hierarquico), scales = "free_y", ncol = 1) +
+  theme_minimal() +
+  labs(
+    title = "Evolução do Erro ao Longo das Janelas de Validação Cruzada",
+    subtitle = "Performance horária em cada iteração (slide_tsibble)",
+    x = "ID da Janela de Teste (.id)",
+    y = "RMSE",
+    color = "Modelo"
+  )
+```
+
+Boxplot de variância
+
+```{r}
+metricas_por_janela_h |> 
+  filter(Nivel_Hierarquico %in% c("1. Topo (Total Geral)", "8. Base")) |> 
+  ggplot(aes(x = .model, y = RMSE, fill = .model)) +
+  geom_boxplot(alpha = 0.7, outlier.color = "red", outlier.size = 2) +
+  facet_wrap(vars(Nivel_Hierarquico), scales = "free_y", ncol = 2) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1), legend.position = "none") +
+  labs(
+    title = "Estabilidade dos Modelos ao Longo do Tempo (Boxplot)",
+    subtitle = "Dispersão do RMSE nas diferentes janelas de teste",
+    x = "Modelo",
+    y = "RMSE"
+  )
 ```
