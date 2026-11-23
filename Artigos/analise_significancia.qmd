@@ -1,0 +1,159 @@
+---
+title: "Significance of base and reconciliation methods"
+author: "Robson"
+format: html
+editor: visual
+---
+
+## Ideia geral
+
+-   **Combinações avaliadas:** 4 métodos base (ARIMA, ETS, NNETAR, Prophet) × 5 métodos de reconciliação (bu, ols, mint, wlss, wlsv) = 20 combinações. As previsões base não reconciliadas ficam de fora, porque não são coerentes e a comparação com elas não seria justa.
+-   **Unidade experimental (bloco):** cada ocasião de previsão = origem × horizonte (12 origens × 6 horizontes = 72 blocos). Todas as 20 combinações são avaliadas nos mesmos blocos → delineamento em blocos completos.
+-   **Resposta não paramétrica:** em cada série × bloco, as 20 combinações são ranqueadas pelo erro absoluto (1 = melhor). Como o ranking é por ponto, RMSE, MAE e MAPE dariam exatamente o mesmo ranking, e o problema de escala entre séries (Total vs. países) desaparece.
+-   **Vetor multivariado:** a média dos ranks dentro de cada nível hierárquico (6 níveis exclusivos) forma a resposta multivariada de cada combinação × bloco.
+
+Três análises:
+
+1.  **Decisão final (independente do nível):** ranks médios sobre os níveis → teste de Friedman + pós-teste de Nemenyi (gráfico MCB), padrão em comparações de métodos de previsão.
+2.  **Efeitos principais e interação:** ANOVA com Aligned Rank Transform (ART), `rank ~ base * reconc * nivel + (1 | bloco)`, com contrastes ajustados por Holm. A interação com `nivel` testa se a melhor combinação muda conforme o nível.
+3.  **Checagem multivariada (análoga à MANOVA):** PERMANOVA no vetor de ranks por nível, com permutações restritas dentro dos blocos.
+
+```{r}
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(ggplot2)
+library(ARTool)    # ANOVA não paramétrica (aligned rank transform)
+library(tsutils)   # teste de Nemenyi / gráfico MCB
+library(vegan)     # PERMANOVA (adonis2)
+library(permute)
+theme_set(theme_bw())
+set.seed(2026)
+```
+
+## Dados
+
+```{r}
+erros <- readRDS("erros_cv.rds")
+
+modelos <- c(a = "ARIMA", e = "ETS", n = "NNETAR", p = "Prophet")
+
+dados <- erros |>
+  filter(str_detect(.model, "_")) |>   # exclui as previsões base (não reconciliadas)
+  mutate(
+    reconc = str_remove(.model, "_.*$"),
+    base   = unname(modelos[str_extract(.model, "[^_]+$")]),
+    combo  = paste(base, reconc, sep = " + "),
+    bloco  = paste0("o", .id, "_h", h)
+  )
+
+# Rank das 20 combinações dentro de cada série × bloco, médio dentro de cada nível
+ranks <- dados |>
+  group_by(bloco, nivel, Continent, Country, Type) |>
+  mutate(rank = rank(ae, ties.method = "average", na.last = "keep")) |>
+  group_by(bloco, h, nivel, base, reconc, combo) |>
+  summarise(rank = mean(rank, na.rm = TRUE), .groups = "drop")
+
+ranks |> count(nivel, name = "linhas")
+```
+
+## Visão descritiva: rank médio por nível
+
+```{r}
+#| fig-width: 10
+#| fig-height: 7
+resumo_nivel <- ranks |>
+  group_by(nivel, base, reconc) |>
+  summarise(rank = mean(rank), .groups = "drop") |>
+  mutate(reconc = factor(reconc, levels = c("bu", "ols", "mint", "wlss", "wlsv")))
+
+p_heat <- ggplot(resumo_nivel, aes(x = reconc, y = base, fill = rank)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = sprintf("%.1f", rank)), size = 3) +
+  scale_fill_viridis_c(direction = -1, name = "Mean rank\n(1 = best)") +
+  facet_wrap(~ nivel) +
+  labs(x = "Reconciliation method", y = "Base method")
+p_heat
+ggsave("heatmap_ranks_nivel.pdf", p_heat, width = 10, height = 7)
+```
+
+## 1. Decisão final: Friedman + Nemenyi (todos os níveis com o mesmo peso)
+
+```{r}
+#| fig-width: 8
+#| fig-height: 9
+geral <- ranks |>
+  group_by(bloco, combo) |>
+  summarise(rank = mean(rank), .groups = "drop")
+
+mat <- geral |>
+  pivot_wider(names_from = combo, values_from = rank) |>
+  select(-bloco) |>
+  as.matrix()
+
+friedman.test(mat)
+
+# Gráfico MCB: combinações cujos intervalos não se sobrepõem ao da melhor
+# são significativamente piores (nível de 5%)
+res_nem <- nemenyi(mat, conf.level = 0.95, plottype = "mcb")
+res_nem
+
+pdf("nemenyi_mcb_geral.pdf", width = 8, height = 9)
+invisible(nemenyi(mat, conf.level = 0.95, plottype = "mcb"))
+dev.off()
+```
+
+```{r}
+# Ranking final das combinações
+geral |>
+  group_by(combo) |>
+  summarise(mean_rank = mean(rank), .groups = "drop") |>
+  arrange(mean_rank)
+```
+
+## 2. Efeitos principais e interação: ANOVA com ART
+
+Observação: como os ranks somam uma constante dentro de cada bloco × nível, o efeito principal de `nivel` é nulo por construção e a variância de `bloco` tende a zero (aviso de *singular fit* é esperado). O que interessa são `base`, `reconc`, `base:reconc` e as interações com `nivel`.
+
+```{r}
+d_art <- ranks |>
+  mutate(across(c(base, reconc, nivel, bloco), factor))
+
+m_art <- art(rank ~ base * reconc * nivel + (1 | bloco), data = d_art)
+anova(m_art)
+```
+
+```{r}
+# Comparações múltiplas (ajuste de Holm)
+art.con(m_art, "base",   adjust = "holm")
+art.con(m_art, "reconc", adjust = "holm")
+```
+
+```{r}
+# Combinações base × reconciliação: 190 pares; exibe só os significativos
+con_combo <- art.con(m_art, "base:reconc", adjust = "holm") |>
+  as.data.frame()
+
+con_combo |>
+  filter(p.value < 0.05) |>
+  arrange(p.value)
+```
+
+## 3. Checagem multivariada: PERMANOVA
+
+Resposta = vetor dos ranks médios nos 6 níveis; permutações apenas dentro de cada bloco (origem × horizonte).
+
+```{r}
+niveis <- sort(unique(ranks$nivel))
+
+Y <- ranks |>
+  select(bloco, base, reconc, nivel, rank) |>
+  pivot_wider(names_from = nivel, values_from = rank) |>
+  drop_na()
+
+resp <- as.matrix(Y[, niveis])
+perm <- how(nperm = 999, blocks = factor(Y$bloco))
+
+adonis2(resp ~ base * reconc, data = Y, method = "euclidean",
+        permutations = perm, by = "terms")
+```

@@ -1,0 +1,211 @@
+---
+title: "CO2 HTS final model reconciled forecasting"
+author: "Robson"
+format: html
+editor: visual
+---
+
+
+```{r}
+library(tsibble)
+library(ggplot2)
+library(GGally)
+library(ipeadatar)
+library(corrplot)
+library(knitr)
+library(dplyr)
+library(tidyr)
+library(fable)
+library(feasts)
+library(lubridate)
+library(stringr)
+library(countrycode)
+library(ggrepel)
+library(fable.prophet)
+theme_set(theme_bw())
+```
+
+```{r}
+co2 <- read.csv("co2-fossil-plus-land-use.csv", header = T)
+
+head(co2)
+```
+
+```{r}
+co2 <- co2 |>
+  rename(
+    CO2total = Annual.CO..emissions.including.land.use.change,
+    CO2landuse = Annual.CO..emissions.from.land.use.change,
+    CO2fossilfuels = Annual.CO..emissions
+  )
+```
+
+```{r}
+co2 <- co2 |>
+  # remove entradas com (GCP)
+  filter(!str_detect(Entity, "\\(GCP\\)")) |>
+  # remove agregações globais e regionais
+  filter(!Entity %in% c("World",
+                        "Africa", "Asia", "Europe", "North America",
+                        "South America", "Oceania",
+                        "European Union (27)", "European Union (28)",
+                        "High-income countries", "Low-income countries",
+                        "Lower-middle-income countries",
+                        "Upper-middle-income countries",
+                        "International aviation", "International shipping",
+                        "Non-OECD", "OECD")) |>
+  # remove agregações regionais tipo "Asia (excl. China and India)"
+  filter(!str_detect(Entity, "excl")) |>
+  arrange(Entity)
+```
+
+```{r}
+co2 <- co2 |>
+  mutate(Continent = countrycode(Entity, origin = "country.name", destination = "continent"))
+```
+
+```{r}
+co2 <- co2 |>
+  mutate(Continent = countrycode(Entity, origin = "country.name", destination = "continent"),
+         Continent = case_when(
+           Entity == "Kosovo" ~ "Europe",
+           Entity == "Micronesia (country)" ~ "Oceania",
+           TRUE ~ Continent
+         ))
+```
+
+```{r}
+valid_countries <- co2 |>
+  filter(Year == 2023) |>
+  drop_na(CO2total, CO2landuse, CO2fossilfuels) |>
+  pull(Entity) |>
+  unique()
+
+co2 <- co2 |>
+  filter(Entity %in% valid_countries)
+```
+
+```{r}
+base_2023 <- co2 |>
+  filter(Year == 2023)
+
+shares_2023 <- base_2023 |>
+  # group_by(Continent) |>
+  mutate(share = CO2total / sum(CO2total, na.rm = TRUE)) |>
+  ungroup()
+
+outros_paises <- shares_2023 |>
+  filter(share <= 0.01) |>
+  pull(Entity)
+
+co2_grouped <- co2 |>
+  mutate(Entity = ifelse(Entity %in% outros_paises,
+                         "Others (<1%)", Entity)) |>
+  group_by(Continent, Entity, Year) |>
+  summarise(
+    CO2total = sum(CO2total, na.rm = TRUE),
+    CO2landuse = sum(CO2landuse, na.rm = TRUE),
+    CO2fossilfuels = sum(CO2fossilfuels, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+co2_grouped |>
+  filter(Entity == "Others (<1%)", Year == 2023)
+```
+
+```{r}
+co2_ts <- co2_grouped |>
+  pivot_longer(cols = CO2total:CO2fossilfuels,
+               names_to = "Type",
+               values_to = "Value") |>
+  mutate(Year = year(as.Date(paste0(Year, "-01-01")))) |>
+  relocate(Year) |>
+  as_tsibble(index = Year, key = c(Continent, Entity, Type)) |>
+  rename(Country = Entity)
+```
+
+```{r}
+labels <- co2_ts |>
+  filter(Type == "CO2total", Continent != "Antarctica") |>
+  group_by(Continent, Country) |>
+  filter(Year == max(Year)) |>
+  ungroup()
+
+co2_ts |>
+  filter_index("1900"~.) |>
+  filter(Type == "CO2total", Continent != "Antarctica") |>
+  ggplot(aes(x = Year, y = Value, color = Country)) +
+  geom_line() +
+  geom_text_repel(
+    data = labels,
+    aes(label = Country),
+    hjust = 0,               
+    nudge_x = 3,             
+    size = 3,
+    segment.color = NA,     
+    direction = "y"        
+  ) +
+  facet_wrap(~Continent, scales = "free_y") +
+  theme(legend.position = "none") +      
+  coord_cartesian(clip = "off")           
+```
+
+```{r}
+co2_hts <- co2_ts |> 
+  filter(Type != "CO2total") |> 
+  filter_index("1900"~.) |>
+  aggregate_key((Continent/Country) * Type, Value = sum(Value))
+```
+
+fitting all models to all data
+
+```{r}
+fit_all <- co2_hts |>
+  model(arima   = ARIMA(Value),
+        ets     = ETS(Value),
+        nnetar  = NNETAR(Value),
+        prophet = prophet(Value)) |>
+  reconcile(
+    bu_a = bottom_up(arima),   
+    ols_a = min_trace(arima, method = "ols"),
+    mint_a = min_trace(arima, method = "mint_shrink"),
+    wlsv_a = min_trace(arima, method = "wls_var"),
+    wlss_a = min_trace(arima, method = "wls_struct"),
+    bu_e = bottom_up(ets),     
+    ols_e = min_trace(ets, method = "ols"),
+    mint_e = min_trace(ets, method = "mint_shrink"),
+    wlsv_e = min_trace(ets, method = "wls_var"),
+    wlss_e = min_trace(ets, method = "wls_struct"),
+    bu_n = bottom_up(nnetar),  
+    ols_n = min_trace(nnetar, method = "ols"),
+    mint_n = min_trace(nnetar, method = "mint_shrink"),
+    wlsv_n = min_trace(nnetar, method = "wls_var"),
+    wlss_n = min_trace(nnetar, method = "wls_struct"),
+    bu_p = bottom_up(prophet), 
+    ols_p = min_trace(prophet, method = "ols"),
+    mint_p = min_trace(prophet, method = "mint_shrink"),
+    wlsv_p = min_trace(prophet, method = "wls_var"),
+    wlss_p = min_trace(prophet, method = "wls_struct")
+  )
+```
+
+```{r}
+fc_all <- fit_all |>
+  forecast(h = 6)
+```
+
+```{r}
+fc_all |> 
+  autoplot(co2_hts)
+```
+
+final model
+
+```{r}
+fit_final <- co2_hts |>
+  model(ets     = ETS(Value)) |>
+  reconcile(
+    ols_e = min_trace(ets, method = "ols")
+  )
+```
+

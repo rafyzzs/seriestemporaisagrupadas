@@ -66,7 +66,69 @@ Por que melhora a métrica: O tráfego horário muda de comportamento rapidament
 
 
 
+28/10
+
+1. criando testes para todas as combinações possíveis da série agrupada (removendo os filters)
+2. adicionadas novas combinações de modelos + reconciliações para avaliar o desempenho de cada uma 
+3. library future antes de rodar os modelos com as reconciliações para o processador usar todos os núcleos
 
 
+30/10
 
+library(future)
+plan(multisession, workers = availableCores() - 1)
+fit_diario_cv <- dados_cv |> 
+  model(
+    # ... seus modelos ...
+  ) |> reconcile(
+    # ... suas reconciliações ...
+  )
+plan(sequential)
+
+outliers extremos são o foco do estudo? dá pra colocar robust = FALSE para diminuir o tempo de execução do STL se não forem
+construção de plots para visualizar os melhores modelos em cada nível hierárquico, evolução do RMSE do stretch e do slide em ambas as modelagens e boxplots para avaliar a existencia de outliers que podem impactar a métrica de um modelo
+comentei o arima e suas reconciliações para verificar se o bloco executava mais rápido
+
+step 24 na modelagem horária n estava rodando, alterei para step 168 (1 semana) e forecast alterado para 24 horas ao invés de 168
+testar depois: step 72 com forecast 24, step 24 com forecast 24, step 24 com forecast 168, step 168 com forecast 72 e 168
+
+modelagem diária: step aumentado para 90 (antes 30), não estava rodando o bloco de previsão e métricas, diminuída a previsão de 61 pra 30. depois testar outros valores
+
+tentar alterar o init (atualmente está 2 anos) p 1095, aumentar de 30 em 30 dias
+1275/aumentar de 30 em dias
+tentar outros valores de forecast
+
+testar Fourier na modelagem horária
+ter pelo menos 3 modelos robustos 
+
+STL com Fourier, Arima com FOURIER, stl com Fourier, ets com suavização exponencial
+testar diferentes steps e forecasts
+
+
+salvar as previsões, com ela dá pra calcular o erro mais facilmente
+armazenar apenas o erro, pra facilitar as métricas depois
+
+testar modelos NNETAR e Prophet
+reconciliação ols
+
+juntar todos os erros em um único de erro
+ggsave
+ctrl shift c para comentar várias linhas de uma vez
+
+
+criado blocos de modelo, reconciliação e previsão para cada modelo individualmente
+warning series não são periódicas ou tem menos de dois períodos para modelo stl com ets na modelagem diária
+
+Descartar tipo de veiculo indefinido
+Juntar classes A, B
+Juntar classe C até H
+Manter I e J (Passeio e moto)
+
+Renomear as classes
+A- Moto
+B- Passeio
+C- Ônibus/2 3 eixos
+D- 4 ou mais eixos
+
+Fazer diferentes gráficos para visualizar o volume com esses novos tipos (Para diferentes KMS e sentidos), uns 5
  

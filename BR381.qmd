@@ -17,7 +17,9 @@ library(future)
 library(ggplot2)
 library(forcats)
 library(dplyr)
+library(furrr)
 ```
+
 
 # 2. Importação e Preparação Inicial
 
@@ -62,7 +64,8 @@ dados_limpos <- dados_brutos |>
     names_to = "Tipo_Veiculo", 
     values_to = "Volume"
   ) |> 
-  mutate(Tipo_Veiculo = str_extract(Tipo_Veiculo, "(?<=\\()[A-Z](?=\\))"))
+  mutate(Tipo_Veiculo = str_extract(Tipo_Veiculo, "(?<=\\()[A-Z](?=\\))")) |> 
+  filter(Tipo_Veiculo != "L")
 ```
 
 # 3. Estruturação Temporal e Tratamento (Imputação)
@@ -70,19 +73,31 @@ dados_limpos <- dados_brutos |>
 Conversão para Tsibble (Horário)
 
 ```{r}
+# 1. Preserva NA quando todos os registros daquela hora estiverem ausentes
 dados_ts <- dados_limpos |> 
   mutate(Data_Hora = make_datetime(year(Data), month(Data), day(Data), as.numeric(Hora))) |> 
   select(-Data, -Hora, -Ano_Arquivo) |> 
   distinct() |> 
+  mutate(
+    Tipo_Veiculo = case_when(
+      Tipo_Veiculo == "J" ~ "A",
+      Tipo_Veiculo == "I" ~ "B",
+      Tipo_Veiculo %in% c("A", "B") ~ "C",
+      Tipo_Veiculo %in% c("C", "D", "E", "F", "G", "H") ~ "D"
+    )
+  ) |> 
   group_by(Estado, BR, KM, Sentido, Tipo_Veiculo, Data_Hora) |> 
-  summarise(Volume = sum(Volume, na.rm = TRUE), .groups = "drop") |> 
+  summarise(
+    Volume = if (all(is.na(Volume))) NA_real_ else sum(Volume, na.rm = TRUE),
+    .groups = "drop"
+  ) |> 
   as_tsibble(index = Data_Hora, key = c(Estado, BR, KM, Sentido, Tipo_Veiculo))
 ```
 
 imputação horária e conversão dos dados para diários. filtrei os kms que estavam com sensores defeituosos, filtrei até novembro de 2024 (dezembro de 2024 estava apresentando muitos dados faltantes e 2025 também). fiz imputação sazonal pelo dia da semana e horário para as lacunas.
 
 ```{r}
-dados_diarios <- dados_ts |> 
+dados_horarios_imputados <- dados_ts |> 
   filter(!KM %in% c("398", "842", "701")) |> 
   filter_index("2021-11-01" ~ "2024-11-30") |> 
   fill_gaps(Volume = NA) |> 
@@ -98,11 +113,16 @@ dados_diarios <- dados_ts |>
     Volume = if_else(is.na(Volume), 0, Volume) 
   ) |> 
   ungroup() |> 
-  select(-Dia_Semana, -Hora_Dia, -Volume_Tipico) |> 
+  select(-Dia_Semana, -Hora_Dia, -Volume_Tipico)
+```
+
+```{r}
+dados_diarios <- dados_horarios_imputados |> 
   group_by_key() |> 
   index_by(Data = as_date(Data_Hora)) |> 
   summarise(Volume = sum(Volume, na.rm = TRUE), .groups = "drop")
 ```
+
 
 # 4. Análise Exploratória
 
@@ -302,63 +322,85 @@ fc_horario |>
 
 ## 7.1 Modelagem Diária (Médio/Longo Prazo com Janela Expansiva)
 
-size 730 = 2 anos e step = 90 (1 trimestre, porém testar com 30 no pc da produção) remover filtro ao rodar no computador da produção, só coloquei pra conseguir rodar no meu
+```{r}
+path <- "Resultados_CV_Diario"
+if(!dir.exists(path)) dir.create(path)
+```
+
+```{r}
+p_init <- 850
+p_step <- 120
+p_h_max <- 30 # Horizonte máximo avaliado (h_max)
+```
 
 ```{r}
 dados_cv <- dados_gts |> 
-  stretch_tsibble(.init = 730, .step = 90)
+  filter(Data <= max(Data) - p_h_max) |> 
+  stretch_tsibble(.init = p_init, .step = p_step)
 ```
 
 ```{r}
-
-plan(multisession, workers = availableCores() - 1)
+plan(multisession, workers = 8)
 
 fit_diario_cv <- dados_cv |> 
   model(
-    base_ets = ETS(Volume),
-    base_stl = decomposition_model(
+    ets = ETS(Volume),
+    stl = decomposition_model(
       STL(Volume ~ season(period = 7) + season(period = 365), robust = TRUE),
       ETS(season_adjust ~ season("N"))
     ),
-    # base_dhr = ARIMA(Volume ~ fourier(period = 7, K = 3) + fourier(period = 365, K = 5) + PDQ(0,0,0))
+    arima_fourier = ARIMA(Volume ~ fourier(period = 7, K = 3) + fourier(period = 365, K = 5) + PDQ(0,0,0))
   ) |> 
   reconcile(
-    ets_bu = bottom_up(base_ets),
-    ets_wls_s = min_trace(base_ets, method = "wls_struct"),
-    ets_wls_v = min_trace(base_ets, method = "wls_var"),
+    # Reconciliações para ETS
+    bu_e = bottom_up(ets),
+    wlss_e = min_trace(ets, method = "wls_struct"),
+    wlsv_e = min_trace(ets, method = "wls_var"),
     
-    # stl_bu = bottom_up(base_stl),
-    # stl_wls_s = min_trace(base_stl, method = "wls_struct"),
-    # stl_wls_v = min_trace(base_stl, method = "wls_var"),
+    # Reconciliações para STL + ETS
+    bu_s = bottom_up(stl),
+    wlss_s = min_trace(stl, method = "wls_struct"),
+    wlsv_s = min_trace(stl, method = "wls_var"),
     
-    # dhr_bu = bottom_up(base_dhr),
-    # dhr_wls_s = min_trace(base_dhr, method = "wls_struct"),
-    # dhr_wls_v = min_trace(base_dhr, method = "wls_var")
+    # Reconciliações para ARIMA + Fourier
+    bu_a = bottom_up(arima_fourier),
+    wlss_a = min_trace(arima_fourier, method = "wls_struct"),
+    wlsv_a = min_trace(arima_fourier, method = "wls_var")
   )
-    
-    plan(sequential)
+
+plan(sequential) 
 ```
 
-Previsões de médio prazo (61 dias) para cada um dos blocos gerados
+```{r}
+fc_diario_cv <- fit_diario_cv |> 
+  forecast(h = p_h_max) |> 
+  group_by_key() |> 
+  mutate(h = row_number()) |> # Horizonte 1..30 dentro de cada origem (.id)
+  ungroup()
+```
 
 ```{r}
+# Salva as previsões brutas em arquivo RDS e limpa a memória
+saveRDS(fc_diario_cv, file.path(path, "fc_diario_cv.rds"))
+rm(fit_diario_cv); gc()
+```
 
-fc_diario_cv <- fit_diario_cv |> forecast(h = "30 days")
+Para extrair o erro
 
-metricas_diarias_cv <- fc_diario_cv |> accuracy(dados_gts)
+```{r}
+# 6. Extração dos valores reais da base original de GTS diária
+obs_diario <- dados_gts |> 
+  as_tibble() |> 
+  select(Data, KM, Sentido, Tipo_Veiculo, obs = Volume)
 
-# ranking geral
-metricas_diarias_cv |> 
-  group_by(.model) |> 
-  summarise(
-    RMSE_Medio = mean(RMSE, na.rm = TRUE), 
-    MAE_Medio = mean(MAE, na.rm = TRUE)
-  ) |> 
-  arrange(RMSE_Medio)
-
-# ranking detalhado por nivel hierarquico
-metricas_diarias_cv |> 
+# 7. Junção com as previsões para calcular o erro absoluto (ae), SE e classificar os níveis
+erros_diarios_cv <- fc_diario_cv |> 
+  as_tibble() |> 
+  select(.model, .id, h, Data, KM, Sentido, Tipo_Veiculo, .mean) |> 
+  left_join(obs_diario, by = c("Data", "KM", "Sentido", "Tipo_Veiculo")) |> 
   mutate(
+    ae = abs(obs - .mean),
+    se = (obs - .mean)^2, 
     Nivel_Hierarquico = case_when(
       is_aggregated(KM) & is_aggregated(Sentido) & is_aggregated(Tipo_Veiculo) ~ "1. Topo (Total Geral)",
       !is_aggregated(KM) & is_aggregated(Sentido) & is_aggregated(Tipo_Veiculo) ~ "2. Apenas por KM",
@@ -368,154 +410,109 @@ metricas_diarias_cv |>
       !is_aggregated(KM) & is_aggregated(Sentido) & !is_aggregated(Tipo_Veiculo) ~ "6. KM x Tipo de Veículo",
       is_aggregated(KM) & !is_aggregated(Sentido) & !is_aggregated(Tipo_Veiculo) ~ "7. Sentido x Tipo de Veículo",
       !is_aggregated(KM) & !is_aggregated(Sentido) & !is_aggregated(Tipo_Veiculo) ~ "8. Base (KM x Sentido x Tipo)"
-    )
+    ),
+    across(c(KM, Sentido, Tipo_Veiculo), as.character)
   ) |> 
-  group_by(Nivel_Hierarquico, .model) |> 
-  summarise(
-    RMSE_Medio = mean(RMSE, na.rm = TRUE), 
-    MAE_Medio = mean(MAE, na.rm = TRUE),
-    .groups = "drop"
-  ) |> 
-  arrange(Nivel_Hierarquico, RMSE_Medio) |> 
-  print(n = Inf) # garante que o console exiba todas as linhas
-```
+  select(.model, .id, h, Nivel_Hierarquico, KM, Sentido, Tipo_Veiculo, obs, .mean, ae, se)
 
-Plot de Gráfico de Barras Agrupadas
-
-```{r}
-metricas_diarias_cv |> 
-  group_by(Nivel_Hierarquico, .model) |> 
-  summarise(RMSE_Medio = mean(RMSE, na.rm = TRUE), .groups = "drop") |> 
-  ggplot(aes(x = RMSE_Medio, y = fct_rev(Nivel_Hierarquico), fill = .model)) +
-  geom_col(position = position_dodge(width = 0.8), width = 0.7) +
-  theme_minimal() +
-  labs(
-    title = "Comparação de Modelos por Nível Hierárquico",
-    subtitle = "RMSE Médio em Validação Cruzada (Médio Prazo)",
-    x = "RMSE Médio",
-    y = "Nível de Agregação",
-    fill = "Modelo / Reconciliação"
-  ) +
-  theme(legend.position = "bottom")
-```
-
-Gráfico de Linhas por Iteração do Stretch Tsibble
-
-```{r}
-metricas_por_janela <- fc_diario_cv |> 
-  group_by(.id, .model) |> 
-  accuracy(dados_gts) |> 
-  mutate(
-    Nivel_Hierarquico = case_when(
-      is_aggregated(KM) & is_aggregated(Sentido) & is_aggregated(Tipo_Veiculo) ~ "1. Topo (Total Geral)",
-      !is_aggregated(KM) & is_aggregated(Sentido) & is_aggregated(Tipo_Veiculo) ~ "2. KM",
-      is_aggregated(KM) & !is_aggregated(Sentido) & is_aggregated(Tipo_Veiculo) ~ "3. Sentido",
-      is_aggregated(KM) & is_aggregated(Sentido) & !is_aggregated(Tipo_Veiculo) ~ "4. Tipo de Veículo",
-      !is_aggregated(KM) & !is_aggregated(Sentido) & is_aggregated(Tipo_Veiculo) ~ "5. KM x Sentido",
-      !is_aggregated(KM) & is_aggregated(Sentido) & !is_aggregated(Tipo_Veiculo) ~ "6. KM x Tipo de Veículo",
-      is_aggregated(KM) & !is_aggregated(Sentido) & !is_aggregated(Tipo_Veiculo) ~ "7. Sentido x Tipo de Veículo",
-      !is_aggregated(KM) & !is_aggregated(Sentido) & !is_aggregated(Tipo_Veiculo) ~ "8. Base"
-    )
-  ) |> 
-  group_by(.id, .model, Nivel_Hierarquico) |> 
-  summarise(RMSE = mean(RMSE, na.rm = TRUE), .groups = "drop")
-
-metricas_por_janela |> 
-  filter(Nivel_Hierarquico %in% c("1. Topo (Total Geral)", "4. Tipo de Veículo", "8. Base")) |> 
-  ggplot(aes(x = .id, y = RMSE, color = .model)) +
-  geom_line(linewidth = 1) +
-  geom_point(size = 2) +
-  facet_wrap(vars(Nivel_Hierarquico), scales = "free_y", ncol = 1) +
-  theme_minimal() +
-  labs(
-    title = "Evolução do Erro ao Longo das Janelas de Validação Cruzada",
-    subtitle = "Performance em cada avanço do stretch_tsibble",
-    x = "ID da Janela de Teste (.id)",
-    y = "RMSE",
-    color = "Modelo"
-  )
-```
-
-Boxplot de variância
-
-```{r}
-metricas_por_janela |> 
-  filter(Nivel_Hierarquico %in% c("1. Topo (Total Geral)", "8. Base")) |> 
-  ggplot(aes(x = .model, y = RMSE, fill = .model)) +
-  geom_boxplot(alpha = 0.7, outlier.color = "red", outlier.size = 2) +
-  facet_wrap(vars(Nivel_Hierarquico), scales = "free_y", ncol = 2) +
-  theme_minimal() +
-  theme(axis.text.x = element_text(angle = 45, hjust = 1), legend.position = "none") +
-  labs(
-    title = "Estabilidade dos Modelos ao Longo do Tempo (Boxplot)",
-    subtitle = "Dispersão do RMSE nas diferentes janelas de teste",
-    x = "Modelo",
-    y = "RMSE"
-  )
+# Salva a tabela de erros em RDS
+saveRDS(erros_diarios_cv, file.path(path, "erros_diarios_cv.rds"))
 ```
 
 
-## 7.2 Modelagem Horária (curto prazo usando stretch)
 
-size 504 horas: 3 semanas e step 24 = 1 dia
+## 7.2 Modelagem Horária (Curto Prazo com Janela Deslizante)
 
 ```{r}
+dados_gts_horario <- dados_horarios_imputados |> 
+  filter(!KM %in% c("398", "842", "701")) |> 
+  filter_index("2024-11-01" ~ "2024-11-30") |> 
+  fill_gaps(Volume = 0) |> 
+  aggregate_key(KM * Sentido * Tipo_Veiculo, Volume = sum(Volume, na.rm = TRUE))
+```
+
+```{r}
+path <- "Resultados_CV_Horario"
+if(!dir.exists(path)) dir.create(path)
+```
+
+```{r}
+# 2. Definição de Parâmetros de Validação Cruzada (Janela Deslizante)
+p_size  <- 504 # Tamanho da janela de treino em horas (3 semanas)
+p_step  <- 168 # Passo entre origens em horas (1 semana)
+p_h_max <- 24  # Horizonte máximo avaliado em horas (1 dia)
+```
+
+```{r}
+# 3. Janela Deslizante (descartando a sobra final sem horizonte completo)
 dados_horario_cv <- dados_gts_horario |> 
-  slide_tsibble(.size = 504, .step = 168)
+  filter(Data_Hora <= max(Data_Hora) - as.difftime(p_h_max, units = "hours")) |> 
+  slide_tsibble(.size = p_size, .step = p_step)
 ```
 
-modelagem e reconciliação
-
 ```{r}
-
-plan(multisession, workers = availableCores() - 1) # aumentar o numero de nucleos do processador
+# 4. Ajuste de Múltiplos Modelos e Reconciliações em Paralelo
+plan(multisession, workers = 8)
 
 fit_horario_cv <- dados_horario_cv |> 
   model(
-    base_snaive = SNAIVE(Volume ~ lag("week")),
-    base_stl = decomposition_model(
+    snaive = SNAIVE(Volume ~ lag("week")),
+    stl = decomposition_model(
       STL(Volume ~ season(period = 24) + season(period = 168), robust = TRUE),
-      ETS(season_adjust ~ season("N")),
-      base_stlf = ARIMA(Volume ~ fourier(period = 24 , K = 5) + fourier(period = 168, K = 5) + PDQ(0,0,0))
-    )
+      ETS(season_adjust ~ season("N"))
+    ),
+    arima_fourier = ARIMA(Volume ~ fourier(period = 24, K = 5) + fourier(period = 168, K = 5) + PDQ(0,0,0))
   ) |> 
   reconcile(
-    snaive_bu = bottom_up(base_snaive),
-    snaive_wls_s = min_trace(base_snaive, method = "wls_struct"),
-    snaive_wls_v = min_trace(base_snaive, method = "wls_var"),
+    # Reconciliações para SNAIVE
+    bu_sn   = bottom_up(snaive),
+    wlss_sn = min_trace(snaive, method = "wls_struct"),
+    wlsv_sn = min_trace(snaive, method = "wls_var"),
     
-    stl_bu = bottom_up(base_stl),
-    stl_wls_s = min_trace(base_stl, method = "wls_struct"),
-    stl_wls_v = min_trace(base_stl, method = "wls_var")
+    # Reconciliações para STL + ETS
+    bu_s   = bottom_up(stl),
+    wlss_s = min_trace(stl, method = "wls_struct"),
+    wlsv_s = min_trace(stl, method = "wls_var"),
+    
+    # Reconciliações para ARIMA + Fourier
+    bu_a   = bottom_up(arima_fourier),
+    wlss_a = min_trace(arima_fourier, method = "wls_struct"),
+    wlsv_a = min_trace(arima_fourier, method = "wls_var")
   )
 
-plan(sequential)
+plan(sequential) # Desliga o paralelo antes do forecast para economizar RAM
 ```
 
-previsão de 1 dia a frente (24 horas) e métricas
+```{r}
+fc_horario_cv <- fit_horario_cv |> 
+  forecast(h = p_h_max) |> 
+  group_by_key() |> 
+  mutate(h = row_number()) |> # Horizonte 1..p_h_max dentro de cada origem (.id)
+  ungroup()
+```
 
 ```{r}
+# Salva as previsões brutas em arquivo RDS e limpa a memória
+saveRDS(fc_horario_cv, file.path(path, "fc_horario_cv.rds"))
+rm(fit_horario_cv); gc()
+```
 
-# 2. Reduza o horizonte de previsão para otimizar o rolling window
-fc_horario_cv <- fit_horario_cv |> forecast(h = "24 hours")
+Para extrair o erro
 
-# 3. Cruze as métricas apenas com os dados do período de teste
-metricas_horarias_cv <- fc_horario_cv |> 
-  accuracy(dados_gts_horario |> filter_index("2024-11-01" ~ "2024-11-30"))
+```{r}
+# 6. Extração dos valores reais da base original de GTS horária
+obs_horario <- dados_gts_horario |> 
+  as_tibble() |> 
+  select(Data_Hora, KM, Sentido, Tipo_Veiculo, obs = Volume)
 
-
-# ranking geral dos modelos horários
-metricas_horarias_cv |> 
-  group_by(.model) |> 
-  summarise(
-    RMSE_Medio = mean(RMSE, na.rm = TRUE), 
-    MAE_Medio = mean(MAE, na.rm = TRUE)
-  ) |> 
-  arrange(RMSE_Medio)
-
-# ranking detalhado por nivel hierarquico (com o typo corrigido)
-metricas_horarias_cv <- metricas_horarias_cv |> 
+# 7. Junção com as previsões para calcular o erro absoluto (ae), SE e classificar os níveis
+erros_horario_cv <- fc_horario_cv |> 
+  as_tibble() |> 
+  select(.model, .id, h, Data_Hora, KM, Sentido, Tipo_Veiculo, .mean) |> 
+  left_join(obs_horario, by = c("Data_Hora", "KM", "Sentido", "Tipo_Veiculo")) |> 
   mutate(
+    ae = abs(obs - .mean),
+    se = (obs - .mean)^2,
     Nivel_Hierarquico = case_when(
       is_aggregated(KM) & is_aggregated(Sentido) & is_aggregated(Tipo_Veiculo) ~ "1. Topo (Total Geral)",
       !is_aggregated(KM) & is_aggregated(Sentido) & is_aggregated(Tipo_Veiculo) ~ "2. Apenas por KM",
@@ -525,96 +522,91 @@ metricas_horarias_cv <- metricas_horarias_cv |>
       !is_aggregated(KM) & is_aggregated(Sentido) & !is_aggregated(Tipo_Veiculo) ~ "6. KM x Tipo de Veículo",
       is_aggregated(KM) & !is_aggregated(Sentido) & !is_aggregated(Tipo_Veiculo) ~ "7. Sentido x Tipo de Veículo",
       !is_aggregated(KM) & !is_aggregated(Sentido) & !is_aggregated(Tipo_Veiculo) ~ "8. Base (KM x Sentido x Tipo)"
-    )
+    ),
+    across(c(KM, Sentido, Tipo_Veiculo), as.character)
   ) |> 
-  group_by(Nivel_Hierarquico, .model) |> 
-  summarise(
-    RMSE_Medio = mean(RMSE, na.rm = TRUE), 
-    MAE_Medio = mean(MAE, na.rm = TRUE),
-    .groups = "drop"
-  ) |> 
-  arrange(Nivel_Hierarquico, RMSE_Medio) |> 
-  print(n = Inf)
+  select(.model, .id, h, Nivel_Hierarquico, KM, Sentido, Tipo_Veiculo, obs, .mean, ae, se)
+
+# Salva a tabela de erros em RDS
+saveRDS(erros_horario_cv, file.path(path, "erros_horario_cv.rds"))
 ```
 
-Plot de Gráfico de Barras Agrupadas
-
 ```{r}
-metricas_horarias_cv |> 
-  # 1. Remove classes complexas do fable para evitar conflitos no ggplot
+library(dplyr)
+library(ggplot2)
+library(scales)
+
+# Mapeamento das categorias de veículos
+rotulos_veiculos <- c(
+  "A" = "Moto",
+  "B" = "Passeio",
+  "C" = "Ônibus/Caminhão de 2 ou 3 eixos",
+  "D" = "Caminhão de 4 ou mais eixos"
+)
+
+# Agrega o volume total por categoria (as_tibble() remove o agrupamento pelo índice temporal)
+resumo_veiculos <- dados_ts |> 
+  filter(!KM %in% c("398", "842", "701")) |> 
+  filter_index("2021-11-01" ~ "2024-11-30") |> 
   as_tibble() |> 
-  group_by(Nivel_Hierarquico, .model) |> 
-  summarise(RMSE_Medio = mean(RMSE, na.rm = TRUE), .groups = "drop") |> 
-  # 2. Mapeamento clássico: Categórico no X, Numérico no Y
-  ggplot(aes(x = .model, y = RMSE_Medio, fill = .model)) +
-  geom_col() +
-  # 3. Força a rotação do gráfico com segurança
-  coord_flip() +
-  # 4. Usa scales = "free" para liberar os eixos em cada um dos 8 quadros
-  facet_wrap(vars(Nivel_Hierarquico), scales = "free", ncol = 2) + 
-  theme_minimal() +
-  labs(
-    title = "Comparação de Modelos por Nível Hierárquico",
-    subtitle = "RMSE Médio em Validação Cruzada (Curto Prazo)",
-    x = "Modelo / Reconciliação",
-    y = "RMSE Médio (Escala Livre por Nível)"
+  group_by(Tipo_Veiculo) |> 
+  summarise(Total_Volume = sum(Volume, na.rm = TRUE), .groups = "drop") |> 
+  mutate(
+    Pct = Total_Volume / sum(Total_Volume) * 100,
+    Legenda = factor(
+      paste0(Tipo_Veiculo, " - ", rotulos_veiculos[Tipo_Veiculo]),
+      levels = paste0(names(rotulos_veiculos), " - ", rotulos_veiculos)
+    )
+  )
+
+# Gráfico de barras horizontais ordenado por volume
+ggplot(resumo_veiculos, aes(x = Total_Volume, y = reorder(Tipo_Veiculo, Total_Volume), fill = Legenda)) +
+  geom_col(width = 0.75) +
+  geom_text(
+    aes(label = sprintf("%s (%.1f%%)", number(Total_Volume, big.mark = ".", decimal.mark = ","), Pct)),
+    hjust = -0.05,
+    size = 3.2
   ) +
+  scale_x_continuous(
+    labels = label_number(scale_cut = cut_short_scale()),
+    expand = expansion(mult = c(0, 0.22))
+  ) +
+  labs(
+    title = "Volume Total de Tráfego por Tipo de Veículo - BR 381 (Nov de 2021 até Nov de 2024)",
+    x = "Volume Total (veículos)",
+    y = "Categoria",
+    fill = "Tipo de Veículo"
+  ) +
+  theme_bw() +
+  theme(
+    legend.position = "right",
+    panel.grid.major.y = element_blank()
+  )
+```
+ 
+```{r}
+rotulos_veiculos <- c(
+  "A" = "A - Moto",
+  "B" = "B - Passeio",
+  "C" = "C - Ônibus/Caminhão de 2 ou 3 eixos",
+  "D" = "D - Caminhão de 4 ou mais eixos"
+)
+
+dados_horarios_imputados |>
+  filter_index("2023-12-01" ~ "2023-12-31") |>
+  filter(KM == "280", Sentido == "C") |>
+  mutate(Tipo_Veiculo = rotulos_veiculos[Tipo_Veiculo]) |>
+  autoplot(Volume) +
+  facet_wrap(~ Tipo_Veiculo, scales = "fixed", ncol = 2) +
+  labs(
+    title = "Volume Horário por Categoria — BR-381 (Km 280, Sentido C)",
+    subtitle = "Dezembro de 2024",
+    x = "Data/Hora",
+    y = "Veículos / hora"
+  ) +
+  theme_minimal() +
   theme(legend.position = "none")
 ```
 
-Gráfico de Linhas por Iteração do Stretch Slide
 
-```{r}
-metricas_por_janela_h <- fc_horario_cv |> 
-  # CORREÇÃO: Agrupar apenas por .id antes do accuracy
-  group_by(.id) |> 
-  accuracy(dados_gts_horario) |> 
-  mutate(
-    Nivel_Hierarquico = case_when(
-      is_aggregated(KM) & is_aggregated(Sentido) & is_aggregated(Tipo_Veiculo) ~ "1. Topo (Total Geral)",
-      !is_aggregated(KM) & is_aggregated(Sentido) & is_aggregated(Tipo_Veiculo) ~ "2. KM",
-      is_aggregated(KM) & !is_aggregated(Sentido) & is_aggregated(Tipo_Veiculo) ~ "3. Sentido",
-      is_aggregated(KM) & is_aggregated(Sentido) & !is_aggregated(Tipo_Veiculo) ~ "4. Tipo de Veículo",
-      !is_aggregated(KM) & !is_aggregated(Sentido) & is_aggregated(Tipo_Veiculo) ~ "5. KM x Sentido",
-      !is_aggregated(KM) & is_aggregated(Sentido) & !is_aggregated(Tipo_Veiculo) ~ "6. KM x Tipo de Veículo",
-      is_aggregated(KM) & !is_aggregated(Sentido) & !is_aggregated(Tipo_Veiculo) ~ "7. Sentido x Tipo de Veículo",
-      !is_aggregated(KM) & !is_aggregated(Sentido) & !is_aggregated(Tipo_Veiculo) ~ "8. Base"
-    )
-  ) |> 
-  # Aqui sim podemos agrupar por .id e .model para tirar a média dos níveis
-  group_by(.id, .model, Nivel_Hierarquico) |> 
-  summarise(RMSE = mean(RMSE, na.rm = TRUE), .groups = "drop")
 
-metricas_por_janela_h |> 
-  filter(Nivel_Hierarquico %in% c("1. Topo (Total Geral)", "4. Tipo de Veículo", "8. Base")) |> 
-  ggplot(aes(x = .id, y = RMSE, color = .model)) +
-  geom_line(linewidth = 1) +
-  geom_point(size = 2) +
-  facet_wrap(vars(Nivel_Hierarquico), scales = "free_y", ncol = 1) +
-  theme_minimal() +
-  labs(
-    title = "Evolução do Erro ao Longo das Janelas de Validação Cruzada",
-    subtitle = "Performance horária em cada iteração (slide_tsibble)",
-    x = "ID da Janela de Teste (.id)",
-    y = "RMSE",
-    color = "Modelo"
-  )
-```
-
-Boxplot de variância
-
-```{r}
-metricas_por_janela_h |> 
-  filter(Nivel_Hierarquico %in% c("1. Topo (Total Geral)", "8. Base")) |> 
-  ggplot(aes(x = .model, y = RMSE, fill = .model)) +
-  geom_boxplot(alpha = 0.7, outlier.color = "red", outlier.size = 2) +
-  facet_wrap(vars(Nivel_Hierarquico), scales = "free_y", ncol = 2) +
-  theme_minimal() +
-  theme(axis.text.x = element_text(angle = 45, hjust = 1), legend.position = "none") +
-  labs(
-    title = "Estabilidade dos Modelos ao Longo do Tempo (Boxplot)",
-    subtitle = "Dispersão do RMSE nas diferentes janelas de teste",
-    x = "Modelo",
-    y = "RMSE"
-  )
-```

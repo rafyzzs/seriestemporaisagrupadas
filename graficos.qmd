@@ -1,0 +1,234 @@
+---
+title: "Gráficos de erro na validação por origem móvel"
+author: "Robson"
+format: html
+editor: visual
+---
+
+```{r}
+# Gráficos dos erros de previsão por nível hierárquico (8 níveis exclusivos)
+# Um arquivo PDF por nível e por métrica, salvo dentro de Resultados_CV_Diario.
+# Painéis: linhas = horizonte (h), colunas = modelo base (ETS, STL+ETS, ARIMA)
+# Eixo y = método de reconciliação; ponto = média entre séries; barra = ± 1 desvio-padrão
+
+library(dplyr)
+library(stringr)
+library(ggplot2)
+theme_set(theme_bw())
+
+path  <- "Resultados_CV_Diario"
+erros <- readRDS(file.path(path, "erros_diarios_cv.rds"))
+
+# Títulos e nomes de arquivo de cada um dos 8 níveis
+niveis <- c(
+  "1. Topo (Total Geral)"         = "1. Topo (Total Geral)",
+  "2. Apenas por KM"              = "2. Apenas por KM",
+  "3. Apenas por Sentido"         = "3. Apenas por Sentido",
+  "4. Apenas por Tipo de Veículo" = "4. Apenas por Tipo de Veículo",
+  "5. KM x Sentido"               = "5. KM x Sentido",
+  "6. KM x Tipo de Veículo"       = "6. KM x Tipo de Veículo",
+  "7. Sentido x Tipo de Veículo"  = "7. Sentido x Tipo de Veículo",
+  "8. Base (KM x Sentido x Tipo)" = "8. Base (KM x Sentido x Tipo)"
+)
+
+arquivos <- c(
+  "1. Topo (Total Geral)"         = "n1_topo",
+  "2. Apenas por KM"              = "n2_km",
+  "3. Apenas por Sentido"         = "n3_sentido",
+  "4. Apenas por Tipo de Veículo" = "n4_tipo_veiculo",
+  "5. KM x Sentido"               = "n5_km_sentido",
+  "6. KM x Tipo de Veículo"       = "n6_km_tipo",
+  "7. Sentido x Tipo de Veículo"  = "n7_sentido_tipo",
+  "8. Base (KM x Sentido x Tipo)" = "n8_base"
+)
+
+metricas <- c("rmse", "mae", "mape")
+unidades <- c(rmse = "RMSE (veículos)", mae = "MAE (veículos)", mape = "MAPE (%)")
+
+modelos       <- c(e = "ETS", s = "STL+ETS", a = "ARIMA")
+ordem_metodos <- c("bu", "wlss", "wlsv") # de baixo para cima no eixo Y
+
+# Métricas por série × horizonte (sobre as origens .id), depois média e dp entre séries
+# Filtra apenas os modelos reconciliados (bu_, wlss_, wlsv_), evitando capturar "arima_fourier"
+metricas_nivel <- erros |>
+  filter(str_detect(.model, "^(bu|wlss|wlsv)_")) |>
+  mutate(ape = if_else(obs != 0, ae / abs(obs) * 100, NA_real_)) |>
+  group_by(.model, h, Nivel_Hierarquico, KM, Sentido, Tipo_Veiculo) |>
+  summarise(
+    rmse = sqrt(mean(ae^2, na.rm = TRUE)),
+    mae  = mean(ae, na.rm = TRUE),
+    mape = mean(ape, na.rm = TRUE),
+    .groups = "drop"
+  ) |>
+  group_by(.model, h, Nivel_Hierarquico) |>
+  summarise(
+    armse = mean(rmse, na.rm = TRUE), amae  = mean(mae, na.rm = TRUE),
+    amape = mean(mape, na.rm = TRUE),
+    srmse = sd(rmse, na.rm = TRUE),   smae  = sd(mae, na.rm = TRUE),
+    smape = sd(mape, na.rm = TRUE),
+    .groups = "drop"
+  ) |>
+  mutate(
+    metodo = factor(str_remove(.model, "_.*$"), levels = ordem_metodos),
+    modelo = factor(unname(modelos[str_extract(.model, "[^_]+$")]),
+                    levels = c("ETS", "STL+ETS", "ARIMA"))
+  )
+
+write.csv(metricas_nivel, file.path(path, "metricas_8niveis.csv"), row.names = FALSE)
+
+# Seleciona horizontes semanais/chave para os painéis não ficarem esmagados (21 ou 30 linhas)
+horizontes_plot <- intersect(c(1, 7, 14, 21, 30), sort(unique(metricas_nivel$h)))
+
+grafico <- function(df, metrica, titulo) {
+  p <- df |>
+    filter(h %in% horizontes_plot) |>
+    mutate(
+      media = .data[[paste0("a", metrica)]],
+      dp    = .data[[paste0("s", metrica)]],
+      inf   = pmax(media - dp, 0),
+      sup   = media + dp
+    ) |>
+    ggplot(aes(x = media, y = metodo, color = metodo)) +
+    geom_linerange(aes(xmin = inf, xmax = sup), na.rm = TRUE) +
+    geom_point(size = 2) +
+    facet_grid(h ~ modelo, scales = "fixed",
+               labeller = labeller(h = label_both)) +
+    labs(x = unidades[[metrica]], y = "Método", title = titulo) +
+    theme(legend.position = "none")
+
+  if (metrica != "mape") {
+    p <- p + scale_x_continuous(
+      labels = scales::label_number(scale_cut = scales::cut_short_scale())
+    )
+  }
+  p
+}
+
+for (nv in names(niveis)) {
+  df <- metricas_nivel |> filter(Nivel_Hierarquico == nv)
+  if (nrow(df) == 0) {
+    message("Nível sem dados: ", nv)
+    next
+  }
+  for (m in metricas) {
+    p <- grafico(df, m, niveis[[nv]])
+    ggsave(file.path(path, paste0("grafico_", arquivos[[nv]], "_", m, ".pdf")),
+           p, width = 10, height = 8, dpi = 300)
+  }
+}
+```
+
+
+Modelagem horária
+```{r}
+# Gráficos dos erros de previsão horária por nível hierárquico (8 níveis exclusivos)
+# Um arquivo PDF por nível e por métrica, salvo dentro de Resultados_CV_Horario.
+# Painéis: linhas = horizonte em horas (h), colunas = modelo base (SNAIVE, STL+ETS, ARIMA)
+# Eixo y = método de reconciliação; ponto = média entre séries; barra = ± 1 desvio-padrão
+
+library(dplyr)
+library(stringr)
+library(ggplot2)
+theme_set(theme_bw())
+
+path  <- "Resultados_CV_Horario"
+erros <- readRDS(file.path(path, "erros_horario_cv.rds"))
+
+# Títulos e nomes de arquivo de cada um dos 8 níveis
+niveis <- c(
+  "1. Topo (Total Geral)"         = "1. Topo (Total Geral)",
+  "2. Apenas por KM"              = "2. Apenas por KM",
+  "3. Apenas por Sentido"         = "3. Apenas por Sentido",
+  "4. Apenas por Tipo de Veículo" = "4. Apenas por Tipo de Veículo",
+  "5. KM x Sentido"               = "5. KM x Sentido",
+  "6. KM x Tipo de Veículo"       = "6. KM x Tipo de Veículo",
+  "7. Sentido x Tipo de Veículo"  = "7. Sentido x Tipo de Veículo",
+  "8. Base (KM x Sentido x Tipo)" = "8. Base (KM x Sentido x Tipo)"
+)
+
+arquivos <- c(
+  "1. Topo (Total Geral)"         = "n1_topo",
+  "2. Apenas por KM"              = "n2_km",
+  "3. Apenas por Sentido"         = "n3_sentido",
+  "4. Apenas por Tipo de Veículo" = "n4_tipo_veiculo",
+  "5. KM x Sentido"               = "n5_km_sentido",
+  "6. KM x Tipo de Veículo"       = "n6_km_tipo",
+  "7. Sentido x Tipo de Veículo"  = "n7_sentido_tipo",
+  "8. Base (KM x Sentido x Tipo)" = "n8_base"
+)
+
+metricas <- c("rmse", "mae", "mape")
+unidades <- c(rmse = "RMSE (veículos/hora)", mae = "MAE (veículos/hora)", mape = "MAPE (%)")
+
+modelos       <- c(sn = "SNAIVE", s = "STL+ETS", a = "ARIMA")
+ordem_metodos <- c("bu", "wlss", "wlsv") # de baixo para cima no eixo Y
+
+# Métricas por série × horizonte (sobre as origens .id), depois média e dp entre séries
+metricas_nivel <- erros |>
+  filter(str_detect(.model, "^(bu|wlss|wlsv)_")) |>
+  mutate(ape = if_else(obs != 0, ae / abs(obs) * 100, NA_real_)) |>
+  group_by(.model, h, Nivel_Hierarquico, KM, Sentido, Tipo_Veiculo) |>
+  summarise(
+    rmse = sqrt(mean(ae^2, na.rm = TRUE)),
+    mae  = mean(ae, na.rm = TRUE),
+    mape = mean(ape, na.rm = TRUE),
+    .groups = "drop"
+  ) |>
+  group_by(.model, h, Nivel_Hierarquico) |>
+  summarise(
+    armse = mean(rmse, na.rm = TRUE), amae  = mean(mae, na.rm = TRUE),
+    amape = mean(mape, na.rm = TRUE),
+    srmse = sd(rmse, na.rm = TRUE),   smae  = sd(mae, na.rm = TRUE),
+    smape = sd(mape, na.rm = TRUE),
+    .groups = "drop"
+  ) |>
+  mutate(
+    metodo = factor(str_remove(.model, "_.*$"), levels = ordem_metodos),
+    modelo = factor(unname(modelos[str_extract(.model, "[^_]+$")]),
+                    levels = c("SNAIVE", "STL+ETS", "ARIMA"))
+  )
+
+write.csv(metricas_nivel, file.path(path, "metricas_8niveis_horario.csv"), row.names = FALSE)
+
+# 5 horizontes distribuídos ao longo do ciclo de 24 horas (1h, 6h, 12h, 18h e 24h)
+horizontes_plot <- intersect(c(1, 6, 12, 18, 24), sort(unique(metricas_nivel$h)))
+
+grafico <- function(df, metrica, titulo) {
+  p <- df |>
+    filter(h %in% horizontes_plot) |>
+    mutate(
+      media = .data[[paste0("a", metrica)]],
+      dp    = .data[[paste0("s", metrica)]],
+      inf   = pmax(media - dp, 0),
+      sup   = media + dp
+    ) |>
+    ggplot(aes(x = media, y = metodo, color = metodo)) +
+    geom_linerange(aes(xmin = inf, xmax = sup), na.rm = TRUE) +
+    geom_point(size = 2) +
+    facet_grid(h ~ modelo, scales = "fixed",
+               labeller = labeller(h = label_both)) +
+    labs(x = unidades[[metrica]], y = "Método", title = titulo) +
+    theme(legend.position = "none")
+
+  if (metrica != "mape") {
+    p <- p + scale_x_continuous(
+      labels = scales::label_number(scale_cut = scales::cut_short_scale())
+    )
+  }
+  p
+}
+
+for (nv in names(niveis)) {
+  df <- metricas_nivel |> filter(Nivel_Hierarquico == nv)
+  if (nrow(df) == 0) {
+    message("Nível sem dados: ", nv)
+    next
+  }
+  for (m in metricas) {
+    p <- grafico(df, m, niveis[[nv]])
+    ggsave(file.path(path, paste0("grafico_", arquivos[[nv]], "_", m, ".pdf")),
+           p, width = 10, height = 8, dpi = 300)
+  }
+}
+```
+

@@ -1,0 +1,104 @@
+---
+title: "Gráficos de erro na validação por origem móvel"
+author: "Robson"
+format: html
+editor: visual
+---
+
+```{r}
+# Gráficos dos erros de previsão por nível hierárquico (6 níveis exclusivos)
+# Um arquivo pdf por nível e por métrica, salvo na mesma pasta do erros_cv.rds.
+# Painéis: linhas = horizonte (h), colunas = modelo base (ARIMA, ETS, NNETAR, Prophet)
+# Eixo y = método de reconciliação; ponto = média entre séries; barra = ± 1 desvio-padrão
+# (RMSE, MAE e MAPE de cada série calculados sobre as 12 origens de cada horizonte)
+
+library(dplyr)
+library(stringr)
+library(ggplot2)
+theme_set(theme_bw())
+
+erros <- readRDS("erros_cv.rds")
+
+# Títulos e nomes de arquivo de cada nível
+niveis <- c(
+  "1 Total"            = "Total",
+  "2 Type"             = "Total by emission type",
+  "3 Continent"        = "Continents",
+  "4 Continent x Type" = "Continents x emission types",
+  "5 Country"          = "Countries",
+  "6 Country x Type"   = "Countries x emission types"
+)
+arquivos <- c(
+  "1 Total"            = "n1_total",
+  "2 Type"             = "n2_type",
+  "3 Continent"        = "n3_continent",
+  "4 Continent x Type" = "n4_continent_type",
+  "5 Country"          = "n5_country",
+  "6 Country x Type"   = "n6_country_type"
+)
+
+metricas <- c("rmse", "mae", "mape")
+unidades <- c(rmse = "RMSE (tonnes)", mae = "MAE (tonnes)", mape = "MAPE (%)")
+
+modelos <- c(a = "ARIMA", e = "ETS", n = "NNETAR", p = "Prophet")
+
+ordem_metodos <- c("bu", "mint", "ols", "wlss", "wlsv")  # de baixo para cima
+
+# Métricas por série × horizonte (sobre as origens), depois média e dp entre séries
+# (só previsões reconciliadas; as previsões base não são coerentes)
+metricas_nivel <- erros |>
+  filter(str_detect(.model, "_")) |>
+  mutate(ape = if_else(obs != 0, ae / abs(obs) * 100, NA_real_)) |>
+  group_by(.model, h, nivel, Continent, Country, Type) |>
+  summarise(rmse = sqrt(mean(ae^2, na.rm = TRUE)),
+            mae  = mean(ae, na.rm = TRUE),
+            mape = mean(ape, na.rm = TRUE),
+            .groups = "drop") |>
+  group_by(.model, h, nivel) |>
+  summarise(armse = mean(rmse, na.rm = TRUE), amae = mean(mae, na.rm = TRUE),
+            amape = mean(mape, na.rm = TRUE),
+            srmse = sd(rmse, na.rm = TRUE),   smae = sd(mae, na.rm = TRUE),
+            smape = sd(mape, na.rm = TRUE), .groups = "drop") |>
+  mutate(
+    metodo = factor(str_remove(.model, "_.*$"), levels = ordem_metodos),
+    modelo = factor(unname(modelos[str_extract(.model, "[^_]+$")]),
+                    levels = c("ARIMA", "ETS", "NNETAR", "Prophet"))
+  )
+
+write.csv(metricas_nivel, "metricas_6niveis.csv", row.names = FALSE)
+
+grafico <- function(df, metrica, titulo) {
+  p <- df |>
+    mutate(media = .data[[paste0("a", metrica)]],
+           dp    = .data[[paste0("s", metrica)]],
+           inf   = pmax(media - dp, 0),
+           sup   = media + dp) |>
+    ggplot(aes(x = media, y = metodo, color = metodo)) +
+    geom_linerange(aes(xmin = inf, xmax = sup), na.rm = TRUE) +
+    geom_point(size = 2) +
+    facet_grid(h ~ modelo, scales = "fixed",
+               labeller = labeller(h = label_both)) +
+    labs(x = unidades[[metrica]], y = "Method", title = titulo) +
+    theme(legend.position = "none")
+
+  # números grandes em toneladas: 1.2B, 350M etc.
+  if (metrica != "mape") {
+    p <- p + scale_x_continuous(
+      labels = scales::label_number(scale_cut = scales::cut_short_scale()))
+  }
+  p
+}
+
+for (nv in names(niveis)) {
+  df <- metricas_nivel |> filter(nivel == nv)
+  if (nrow(df) == 0) {
+    message("Nível sem dados: ", nv)
+    next
+  }
+  for (m in metricas) {
+    p <- grafico(df, m, niveis[[nv]])
+    ggsave(paste0("grafico_", arquivos[[nv]], "_", m, ".pdf"),
+           p, width = 10, height = 8, dpi = 300)
+  }
+}
+```
