@@ -353,22 +353,25 @@ fit_diario_cv <- dados_cv |>
   ) |> 
   reconcile(
     # Reconciliações para ETS
-    bu_e = bottom_up(ets),
+    bu_e   = bottom_up(ets),
     wlss_e = min_trace(ets, method = "wls_struct"),
     wlsv_e = min_trace(ets, method = "wls_var"),
+    mint_e = min_trace(ets, method = "mint_shrink"),
     
     # Reconciliações para STL + ETS
-    bu_s = bottom_up(stl),
+    bu_s   = bottom_up(stl),
     wlss_s = min_trace(stl, method = "wls_struct"),
     wlsv_s = min_trace(stl, method = "wls_var"),
+    mint_s = min_trace(stl, method = "mint_shrink"),
     
     # Reconciliações para ARIMA + Fourier
-    bu_a = bottom_up(arima_fourier),
+    bu_a   = bottom_up(arima_fourier),
     wlss_a = min_trace(arima_fourier, method = "wls_struct"),
-    wlsv_a = min_trace(arima_fourier, method = "wls_var")
+    wlsv_a = min_trace(arima_fourier, method = "wls_var"),
+    mint_a = min_trace(arima_fourier, method = "mint_shrink")
   )
 
-plan(sequential) 
+plan(sequential)
 ```
 
 ```{r}
@@ -468,16 +471,19 @@ fit_horario_cv <- dados_horario_cv |>
     bu_sn   = bottom_up(snaive),
     wlss_sn = min_trace(snaive, method = "wls_struct"),
     wlsv_sn = min_trace(snaive, method = "wls_var"),
+    mint_sn = min_trace(snaive, method = "mint_shrink"),
     
     # Reconciliações para STL + ETS
-    bu_s   = bottom_up(stl),
-    wlss_s = min_trace(stl, method = "wls_struct"),
-    wlsv_s = min_trace(stl, method = "wls_var"),
+    bu_s    = bottom_up(stl),
+    wlss_s  = min_trace(stl, method = "wls_struct"),
+    wlsv_s  = min_trace(stl, method = "wls_var"),
+    mint_s  = min_trace(stl, method = "mint_shrink"),
     
     # Reconciliações para ARIMA + Fourier
-    bu_a   = bottom_up(arima_fourier),
-    wlss_a = min_trace(arima_fourier, method = "wls_struct"),
-    wlsv_a = min_trace(arima_fourier, method = "wls_var")
+    bu_a    = bottom_up(arima_fourier),
+    wlss_a  = min_trace(arima_fourier, method = "wls_struct"),
+    wlsv_a  = min_trace(arima_fourier, method = "wls_var"),
+    mint_a  = min_trace(arima_fourier, method = "mint_shrink")
   )
 
 plan(sequential) # Desliga o paralelo antes do forecast para economizar RAM
